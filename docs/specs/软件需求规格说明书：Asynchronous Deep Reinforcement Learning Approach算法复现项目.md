@@ -147,6 +147,56 @@ $$r_i^t(o_i^t, a_i^t) = -\eta_t T_{i,t} - \eta_e E_{i,t} - \sum_{\iota=1}^{5} \l
 
 **算法流程：** 实现Algorithm 1，复杂度 $O(N^2)$。
 
+#### 设备关联（One-to-Many Matching）算法伪代码
+
+Algorithm 1: One-to-many Matching Algorithm for Device Association
+
+Input : The set of IoTDs N, the set of UAVs M
+1   Initialization: Select a random matching y and perform calculations
+      by Eqs. (43) and (44);
+2   while No swap matching ym′ exists do
+3       Select IoTD n ∈ N, y(n) = m and IoTD n′ ∈ y(m′);
+4       if IoTDs pair (n, n′) is a swap matching then
+5           y ← ym′;
+6           Compute Eqs. (43) and (44);
+7       end
+8   end
+9   Acquire optimal matching y*;
+10  Calculate the device association strategy via Eq. (42);
+
+Output: The number of IoTDs Nm for each UAV m and IoTD
+        association vector B.
+
+该算法通过迭代执行有效的交换匹配，直到达到双边交换稳定状态，即不存在能进一步增加至少一方效用且不降低任何相关方效用的交换对为止。
+其中使用的公式如下：
+
+##### 公式 (42) — 匹配指示函数
+将匹配函数 $y$ 转化为设备匹配指示变量 $b_{n,m}$：
+\[
+b_{n,m} = 
+\begin{cases} 
+1, & \text{if } m = y(n); \\
+0, & \text{otherwise}.
+\end{cases}
+\tag{42}
+\]
+
+##### 公式 (43) 和 (44) — 偏好效用函数
+- 物联网设备 $n$ 的偏好基于上行数据速率：
+\[
+\Psi_n(y) = R_{nm}^{up}(y)
+\tag{43}
+\]
+- 无人机 $m$ 的偏好基于最小化能耗（表示为负能耗）：
+\[
+\Psi_m(y) = -E_{n,j}^{d,n,m}(y)
+\tag{44}
+\]
+
+其中：
+- $R_{nm}^{up}$ 为设备 $n$ 到无人机 $m$ 的上行传输速率（定义见式(9)）；
+- $E_{n,j}^{d,n,m}$ 为任务结果从无人机 $m$ 下行传输至设备 $n$ 的能耗（定义见式(21)）。
+
 ### 3.2 第二阶段：多应用任务序列（MATS）
 
 | 功能ID | 功能描述 | 输入 | 输出 |
@@ -160,6 +210,44 @@ $$r_i^t(o_i^t, a_i^t) = -\eta_t T_{i,t} - \eta_e E_{i,t} - \sum_{\iota=1}^{5} \l
 $$ERR[v_{i,j}, u] = \max_{v_{i,j'} \in Suc(v_{i,j})} \min_{u \in U_i} \{ERR[v_{i,j'}, u] + T_{i,j',u}^{Exe} + T_{i,j',j,u}^{Trans}\}$$
 
 $$rank(v_{i,j}) = \sum_{u=1}^{|U|} \frac{ERR[v_{i,j}, u]}{|U|}$$
+
+#### 设备关联（One-to-Many Matching）算法伪代码
+##### 算法伪代码
+
+```text
+Algorithm 2: Multi-application Task Sequence Algorithm for Task Scheduling
+
+Input : Set of DAG applications G = {G_n | n ∈ N_i} for agent i,
+        agent index i
+Output: Ordered task execution sequence for agent i
+
+1  Merge all applications from IoTDs associated with agent i into a
+   single DAG G_i = (V_i, E_i) by adding a dummy entry task v_i,entry
+   and a dummy exit task v_i,exit with zero computation and
+   communication costs;
+2  for each task v_i,j ∈ V_i do
+3      Compute the upward rank value rank(v_i,j) using Eq. (45);
+4  end
+5  Sort all tasks in V_i in non-increasing order of their rank(v_i,j)
+   values;
+6  return The sorted task sequence as the execution order for agent i;
+```
+
+##### 使用的公式
+
+**公式 (45) — 任务向上排序值 (Upward Rank)**
+
+任务 $v_{i,j}$ 的向上排序值定义为该任务平均计算开销与其所有直接后继任务中最大（向上排序值 + 平均通信开销）之和：
+
+\[
+rank(v_{i,j}) = \overline{w_{i,j}} + \max_{v_{i,k} \in succ(v_{i,j})} \left( \overline{c_{i,j,k}} + rank(v_{i,k}) \right)
+\tag{45}
+\]
+
+其中：
+- $\overline{w_{i,j}}$ 为任务 $v_{i,j}$ 在所有可用计算节点上的平均执行时间；
+- $succ(v_{i,j})$ 表示任务 $v_{i,j}$ 的直接后继任务集合；
+- $\overline{c_{i,j,k}}$ 表示任务 $v_{i,j}$ 与 $v_{i,k}$ 之间的平均数据传输时间。
 
 ### 3.3 第三阶段：AMAPPO训练与推理
 
@@ -203,6 +291,79 @@ $$rank(v_{i,j}) = \sum_{u=1}^{|U|} \frac{ERR[v_{i,j}, u]}{|U|}$$
 
 **优势函数（GAE）：**
 $$\hat{A}^t(a_i^t, o_i^t) = \sum_{j=1}^{|V_i|-t+1} (\gamma\varphi)^j(r^{t+j} + \gamma V_i(o_m^{t+j+1}) - V_m(o_m^{t+j}))$$
+
+#### AMAPPO算法伪代码：
+##### 算法伪代码
+
+```text
+Algorithm 3: Training Process of AMAPPO
+
+1   Set memory buffer size MB = {};
+2   Initialize transition buffer for each agent ξ₁, ..., ξ_I;
+3   Initialize parameters φ and θ for the actor and critic networks;
+4   Initialize RNN states h₁,π⁰, ..., h_I,π⁰ for actor network;
+5   Initialize RNN states h₁,V⁰, ..., h_I,V⁰ for critic network;
+6   for each epoch = 1 → ep do
+7       for each time slot t′ = 1, 2, ..., GT do
+8           for each available agent i do
+9               Acquire ξ̃_i = (s_i^{t′}, o_i^{t′}, r_i^{t′});
+10              ξ_i^{t′−1} ← ξ_i^{t′−1} ∪ ξ̃_i;
+11              ξ_i ← ξ_i ∪ ξ_i^{t′−1};
+12              a_i^{t′}, h_i,π^{t′} = π_i(o_i^{t′}, h_i,π^{t′−1}; φ);
+13              h_i,V^{t′} = V_i(o_i^{t′}, h_i,V^{t′−1}; θ);
+14              Acquire ξ_i = (s_i^{t′}, o_i^{t′}, h_i,π^{t′}, h_i,V^{t′}, a_i^{t′});
+15          end
+16          Execute action a_i^{t′};
+17      end
+18      for all agents i do
+19          MB ← MB ∪ ξ_i;
+20      end
+21      Calculate rewards-to-go R̂ = Σ_{i=1}^{|V_i|−t′+1} γ_i r_i^{t′+1} on MB;
+22      Calculate advantage estimate Â^t by Eq. (57) on MB;
+23      Update θ by minimizing the loss function in Eq. (55);
+24      Update φ using PPO-clip with the objective function in Eq. (56);
+25  end
+
+Output: The trained collaborative policy network π_i and critic network V_i
+        for all the agents.
+```
+
+##### 使用的公式
+
+**公式 (55) — Critic 网络损失函数 (TD误差)**
+
+\[
+L_{i}^{C}(\theta) = \mathbb{E}_{t}\left[ r_{i}^{t} + \gamma V_{i}(o_{i}^{t+1};\theta) - V_{i}(o_{i}^{t};\theta) \right]^{2}
+\tag{55}
+\]
+
+其中：
+- $r_i^t$ 为智能体 $i$ 在时刻 $t$ 的即时奖励；
+- $\gamma$ 为折扣因子；
+- $V_i(\cdot;\theta)$ 为参数 $\theta$ 下的价值函数。
+
+**公式 (56) — Actor 网络损失函数 (PPO-Clip目标)**
+
+\[
+L_i^A(\phi) = \mathbb{E}_t \left[ \min \left( pp^t(\phi), \text{clip}(pp^t(\phi), 1 - \epsilon_{clip}, 1 + \epsilon_{clip}) \right) \cdot \hat{A}^t(a_i^t, o_i^t) \right]
+\tag{56}
+\]
+
+其中：
+- $pp^t(\phi) = \frac{\pi_i(a_i^t|o_i^t;\phi)}{\pi_i(a_i^t|o_i^t;\phi_{old})}$ 为新旧策略概率比；
+- $\epsilon_{clip}$ 为裁剪范围超参数；
+- $\hat{A}^t(\cdot)$ 为广义优势估计值。
+
+**公式 (57) — 广义优势估计 (GAE)**
+
+\[
+\hat{A}^{t}(a_{i}^{t},o_{i}^{t}) = \sum_{j=1}^{|V_i|-t+1} (\gamma \varphi)^{j} \left( r^{t+j} + \gamma V_{i}(o_{i}^{t+j+1}) - V_{i}(o_{i}^{t+j}) \right)
+\tag{57}
+\]
+
+其中：
+- $\varphi \in [0,1]$ 为平滑参数，平衡估计的准确性与稳定性；
+- $r^{t+j}$ 为第 $t+j$ 步的奖励。
 
 ### 3.4 对比算法接口（用于评估）
 

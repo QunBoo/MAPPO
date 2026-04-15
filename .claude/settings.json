@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python env/dag_generator.py)",
+      "Bash(python env/channel_model.py)",
+      "Bash(D:/ProgramFiles/miniConda/envs/appo/python.exe -c \"import torch; print\\('torch:', torch.__version__\\)\")",
+      "Bash(D:/ProgramFiles/miniConda/envs/appo/python.exe -m pip install torch-geometric)",
+      "Bash(python models/gnn_encoder.py)",
+      "Bash(\"D:/ProgramFiles/miniConda/envs/appo/python.exe\" models/gnn_encoder.py)",
+      "Bash(conda run *)",
+      "Read(//d/ProgramFiles/miniConda/envs//**)"
+    ]
+  }
+}
