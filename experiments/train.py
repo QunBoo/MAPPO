@@ -15,6 +15,7 @@ import argparse
 import os
 import sys
 import random
+import time
 import numpy as np
 import torch
 
@@ -93,6 +94,8 @@ def main():
 
     set_seed(config.seed)
 
+    start_time = time.time()
+
     if config.algo == "amappo":
         from algorithms.amappo import AMAPPOTrainer
         trainer = AMAPPOTrainer(config)
@@ -103,6 +106,11 @@ def main():
         raise ValueError(f"Unknown algo: {config.algo}")
 
     trainer.train()
+
+    elapsed = time.time() - start_time
+    hours, remainder = divmod(elapsed, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"[train.py] Training completed in {int(hours)}h {int(minutes)}m {seconds:.2f}s")
 
 
 if __name__ == "__main__":
