@@ -152,8 +152,8 @@ python experiments/train.py --algo amappo --epochs 1500 --seed 42 --device cuda
 
 # 多 seed 对比实验
 for seed in 42 123 456 789 1024; do
-    python experiments/train.py --algo amappo --epochs 1500 --seed $seed
-    python experiments/train.py --algo mappo  --epochs 1500 --seed $seed
+    python experiments/train.py --algo amappo --epochs 1500 --device cuda --seed $seed
+    python experiments/train.py --algo mappo  --epochs 1500 --device cuda --seed $seed
 done
 ```
 
