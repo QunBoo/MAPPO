@@ -215,11 +215,12 @@ class MAPPOAgentV2:
         h_pi_init = h_pi_batch.squeeze(1).squeeze(1).unsqueeze(0)  # (1, B, 64)
 
         discrete_actions = actions_batch[:, :self.actor.n_disc].argmax(dim=-1)  # (B,)
+        continuous_actions = actions_batch[:, self.actor.n_disc:self.actor.n_disc + self.actor.n_cont]  # (B, n_cont)
 
         self.actor.train()
         log_probs, entropies, h_pi_next = self.actor.evaluate(
             h_v_t_batch, L_us_agg_batch, server_agg_batch,
-            a_prev_batch, h_pi_init, node_embs, discrete_actions,
+            a_prev_batch, h_pi_init, node_embs, discrete_actions, continuous_actions,
         )
 
         h_V_init = h_V_batch.squeeze(1).squeeze(1).unsqueeze(0)  # (1, B, 64)

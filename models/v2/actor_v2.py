@@ -135,6 +135,7 @@ class ActorV2(nn.Module):
         h_prev:         Optional[torch.Tensor],  # (1, B, 64) or None
         node_embs:      torch.Tensor,   # (N, 64)
         discrete_actions: torch.Tensor, # (B,) int
+        continuous_actions: Optional[torch.Tensor] = None,  # (B, n_cont)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Batch evaluation for PPO update.
@@ -155,7 +156,19 @@ class ActorV2(nn.Module):
 
         disc_logits = self.discrete_head(c_t)       # (B, n_disc)
         dist_disc = Categorical(logits=disc_logits)
-        log_probs = dist_disc.log_prob(discrete_actions.long())  # (B,)
-        entropies = dist_disc.entropy()                           # (B,)
+        log_probs_disc = dist_disc.log_prob(discrete_actions.long())  # (B,)
+        entropies_disc = dist_disc.entropy()                           # (B,)
+
+        # Continuous action head
+        cont_mean = torch.sigmoid(self.cont_mean_head(c_t))  # (B, n_cont)
+        dist_cont = Normal(cont_mean, self.log_std.exp())
+        if continuous_actions is not None:
+            log_probs_cont = dist_cont.log_prob(continuous_actions).sum(dim=-1)  # (B,)
+        else:
+            log_probs_cont = torch.zeros(B, device=h_v_t.device)
+        entropies_cont = dist_cont.entropy().sum(dim=-1)  # (B,)
+
+        log_probs = log_probs_disc + log_probs_cont  # (B,)
+        entropies = entropies_disc + entropies_cont   # (B,)
 
         return log_probs, entropies, h_next

@@ -217,6 +217,7 @@ class AMAPPOv2Trainer:
                     h_V=h_V.detach().cpu().numpy(),
                     global_obs=global_obs.copy(),
                     done=False,
+                    log_prob=log_prob,
                 )
                 self.agent_buffers[m].add(t)
 
@@ -257,6 +258,7 @@ class AMAPPOv2Trainer:
         h_V_t        = torch.tensor(batch["h_V"],        dtype=torch.float32, device=self.device)
         global_obs_t = torch.tensor(batch["global_obs"], dtype=torch.float32, device=self.device)
         dones_t      = torch.tensor(batch["dones"],      dtype=torch.float32, device=self.device)
+        log_probs_old_t = torch.tensor(batch["log_probs"], dtype=torch.float32, device=self.device)
 
         B = obs_t.shape[0]
         dag_x, dag_ei, res_x, res_ei = _build_graph_inputs_v2(self.env, 0)
@@ -286,39 +288,48 @@ class AMAPPOv2Trainer:
         returns_t    = torch.tensor(returns_np,    dtype=torch.float32, device=self.device)
         advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
 
-        agent = self.agents[0]
-        self.shared_encoder.train()
-        agent.actor.train()
-        agent.critic.train()
+        # Aggregate loss over all agents (parameter sharing)
+        total_actor_loss = 0.0
+        total_critic_loss = 0.0
+        total_entropy = 0.0
 
-        log_probs_new, entropies, values_new, _ = agent.evaluate_actions(
-            obs_t, actions_t, global_obs_t, h_pi_t, h_V_t,
-            dag_x, dag_ei, res_x, res_ei,
-        )
+        for agent in self.agents:
+            self.shared_encoder.train()
+            agent.actor.train()
+            agent.critic.train()
 
-        log_probs_old = log_probs_new.detach()
-        ratio  = torch.exp(log_probs_new - log_probs_old)
-        surr1  = ratio * advantages_t
-        surr2  = torch.clamp(ratio, 1 - self.cfg.eps_clip, 1 + self.cfg.eps_clip) * advantages_t
-        actor_loss  = -torch.min(surr1, surr2).mean()
-        critic_loss = nn.functional.mse_loss(values_new, returns_t)
-        entropy     = entropies.mean()
+            log_probs_new, entropies, values_new, _ = agent.evaluate_actions(
+                obs_t, actions_t, global_obs_t, h_pi_t, h_V_t,
+                dag_x, dag_ei, res_x, res_ei,
+            )
 
-        loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+            ratio  = torch.exp(log_probs_new - log_probs_old_t)
+            surr1  = ratio * advantages_t
+            surr2  = torch.clamp(ratio, 1 - self.cfg.eps_clip, 1 + self.cfg.eps_clip) * advantages_t
+            actor_loss  = -torch.min(surr1, surr2).mean()
+            critic_loss = nn.functional.mse_loss(values_new, returns_t)
+            entropy     = entropies.mean()
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(
-            [p for pg in self.optimizer.param_groups for p in pg["params"]],
-            self.cfg.max_grad_norm,
-        )
-        self.optimizer.step()
-        self._train_step += 1
+            loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
 
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(
+                [p for pg in self.optimizer.param_groups for p in pg["params"]],
+                self.cfg.max_grad_norm,
+            )
+            self.optimizer.step()
+            self._train_step += 1
+
+            total_actor_loss += actor_loss.item()
+            total_critic_loss += critic_loss.item()
+            total_entropy += entropy.item()
+
+        M = len(self.agents)
         return {
-            "actor_loss":  actor_loss.item(),
-            "critic_loss": critic_loss.item(),
-            "entropy":     entropy.item(),
+            "actor_loss":  total_actor_loss / M,
+            "critic_loss": total_critic_loss / M,
+            "entropy":     total_entropy / M,
         }
 
     # ------------------------------------------------------------------

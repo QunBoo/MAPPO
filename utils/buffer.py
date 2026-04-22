@@ -13,6 +13,7 @@ class Transition:
     h_V: np.ndarray        # (1, 1, 64) critic GRU hidden state
     global_obs: np.ndarray # (148,) global state (all agents concatenated)
     done: bool             # episode done flag
+    log_prob: float = 0.0  # log probability of action under old policy
 
 
 class AgentBuffer:
@@ -44,6 +45,7 @@ class GlobalBuffer:
         self._h_V: list = []
         self._global_obs: list = []
         self._dones: list = []
+        self._log_probs: list = []
 
     def add_from_agent_buffer(self, agent_buffer: AgentBuffer):
         """Pour all transitions from an agent buffer into the global pool."""
@@ -55,6 +57,7 @@ class GlobalBuffer:
             self._h_V.append(t.h_V)
             self._global_obs.append(t.global_obs)
             self._dones.append(float(t.done))
+            self._log_probs.append(t.log_prob)
 
         # Trim to capacity (oldest first)
         if len(self._obs) > self.capacity:
@@ -66,6 +69,7 @@ class GlobalBuffer:
             self._h_V = self._h_V[excess:]
             self._global_obs = self._global_obs[excess:]
             self._dones = self._dones[excess:]
+            self._log_probs = self._log_probs[excess:]
 
     def sample(self, batch_size: int = 128) -> Dict[str, np.ndarray]:
         """Sample a mini-batch. Returns dict with numpy arrays."""
@@ -81,6 +85,7 @@ class GlobalBuffer:
             'h_V':        np.array([self._h_V[i]        for i in indices]),  # (B, 1, 1, 64)
             'global_obs': np.array([self._global_obs[i] for i in indices]),  # (B, 148)
             'dones':      np.array([self._dones[i]      for i in indices]),  # (B,)
+            'log_probs':  np.array([self._log_probs[i]  for i in indices]),  # (B,)
         }
 
     def clear(self):
@@ -91,6 +96,7 @@ class GlobalBuffer:
         self._h_V.clear()
         self._global_obs.clear()
         self._dones.clear()
+        self._log_probs.clear()
 
     def __len__(self):
         return len(self._obs)
