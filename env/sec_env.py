@@ -322,9 +322,10 @@ class SECEnv:
             )
 
             # --- Reward ---
+            _E_SCALE = 0.01  # scale E_i to the same magnitude as T_i (E_i ~100x larger otherwise)
             r_m = (
                 -self.eta_t * T_i
-                - self.eta_e * E_i
+                - self.eta_e * E_i * _E_SCALE
                 - self.lam  * float(np.sum(phi))
             )
             rewards[m] = float(r_m)

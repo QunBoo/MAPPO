@@ -14,6 +14,9 @@ class Transition:
     global_obs: np.ndarray # (148,) global state (all agents concatenated)
     done: bool             # episode done flag
     log_prob: float = 0.0  # log probability of action under old policy
+    advantage: float = 0.0 # GAE advantage (pre-computed on sequential trajectory)
+    ret: float = 0.0       # GAE return (pre-computed on sequential trajectory)
+    task_id: int = 0       # which DAG node this decision corresponds to
 
 
 class AgentBuffer:
@@ -46,6 +49,9 @@ class GlobalBuffer:
         self._global_obs: list = []
         self._dones: list = []
         self._log_probs: list = []
+        self._advantages: list = []
+        self._returns: list = []
+        self._task_ids: list = []
 
     def add_from_agent_buffer(self, agent_buffer: AgentBuffer):
         """Pour all transitions from an agent buffer into the global pool."""
@@ -58,6 +64,9 @@ class GlobalBuffer:
             self._global_obs.append(t.global_obs)
             self._dones.append(float(t.done))
             self._log_probs.append(t.log_prob)
+            self._advantages.append(t.advantage)
+            self._returns.append(t.ret)
+            self._task_ids.append(t.task_id)
 
         # Trim to capacity (oldest first)
         if len(self._obs) > self.capacity:
@@ -70,6 +79,9 @@ class GlobalBuffer:
             self._global_obs = self._global_obs[excess:]
             self._dones = self._dones[excess:]
             self._log_probs = self._log_probs[excess:]
+            self._advantages = self._advantages[excess:]
+            self._returns = self._returns[excess:]
+            self._task_ids = self._task_ids[excess:]
 
     def sample(self, batch_size: int = 128) -> Dict[str, np.ndarray]:
         """Sample a mini-batch. Returns dict with numpy arrays."""
@@ -86,6 +98,9 @@ class GlobalBuffer:
             'global_obs': np.array([self._global_obs[i] for i in indices]),  # (B, 148)
             'dones':      np.array([self._dones[i]      for i in indices]),  # (B,)
             'log_probs':  np.array([self._log_probs[i]  for i in indices]),  # (B,)
+            'advantages': np.array([self._advantages[i] for i in indices]),  # (B,)
+            'returns':    np.array([self._returns[i]    for i in indices]),  # (B,)
+            'task_ids':   np.array([self._task_ids[i]   for i in indices]),  # (B,)
         }
 
     def clear(self):
@@ -97,6 +112,9 @@ class GlobalBuffer:
         self._global_obs.clear()
         self._dones.clear()
         self._log_probs.clear()
+        self._advantages.clear()
+        self._returns.clear()
+        self._task_ids.clear()
 
     def __len__(self):
         return len(self._obs)

@@ -1,8 +1,8 @@
 # AMAPPOv2 算法技术规格文档
 
-> **版本**: v2  
+> **版本**: v2.1  
 > **最后更新**: 2026-04-22  
-> **核心模块**: `algorithms/amappo_v2.py`, `models/v2/`, `utils/buffer.py`
+> **核心模块**: `algorithms/amappo_v2.py`, `models/v2/`, `utils/buffer.py`, `env/sec_env.py`
 
 ---
 
@@ -214,9 +214,9 @@ Critic 同样使用 GRU 维护时序隐状态 `h_V`。
 | 方法 | 调用时机 | 功能 |
 |------|---------|------|
 | `encode()` | Episode 开始时调用一次 | 运行 GNN 编码器，缓存 `node_embs`, `server_embs`, `graph_enc`，计算拓扑排序，初始化 GRU 隐状态 |
-| `act()` | 每步决策时调用 | 获取当前任务节点嵌入、聚合上游决策、调用 Actor 推理动作 |
+| `act()` | 每步决策时调用 | 获取当前任务节点嵌入、聚合上游决策、调用 Actor 推理动作；返回后 `step_idx` 已自增，可由调用方读取 `topo_order[step_idx - 1]` 得到本次 `task_id` |
 | `get_value()` | 每步决策时调用 | 调用 Critic 估计全局状态价值 |
-| `evaluate_actions()` | PPO 更新时调用 | 批量重新计算 log_prob、entropy、value |
+| `evaluate_actions(…, task_ids_batch)` | PPO 更新时调用 | 批量重新计算 log_prob、entropy、value；需传入 `task_ids_batch(B,)` 以按 task_id 索引 node_embs，保证与 `act()` 的 embedding 一致 |
 | `reset_episode()` | Episode 结束时调用 | 清空缓存、重置隐状态 |
 
 #### 上游决策聚合 (`L_us_agg`)
@@ -252,6 +252,9 @@ upstream_actions = [self.decisions[t] for t in self.topo_order[:self.step_idx] i
 | `global_obs` | `(148,)` | 全局状态（CTDE） |
 | `done` | bool | Episode 结束标志 |
 | `log_prob` | scalar | 旧策略的 log 概率 |
+| `advantage` | scalar | GAE 优势（在顺序轨迹上预计算后写入） |
+| `ret` | scalar | GAE 回报（advantage + V(s)） |
+| `task_id` | int | 本次决策对应的 DAG 任务节点索引 |
 
 ### 4.2 AgentBuffer
 
@@ -261,9 +264,9 @@ upstream_actions = [self.decisions[t] for t in self.topo_order[:self.step_idx] i
 
 全局经验池 MB，容量 50000，先进先出。提供：
 
-- `add_from_agent_buffer()`: 从 AgentBuffer 倒入数据
-- `sample(batch_size)`: 随机采样 mini-batch
-- `compute_returns_and_advantages()`: 计算 GAE 优势和回报
+- `add_from_agent_buffer()`: 从 AgentBuffer 倒入数据（含预计算的 `advantage`、`ret`、`task_id`）
+- `sample(batch_size)`: 随机采样 mini-batch，返回包含 `advantages`、`returns`、`task_ids` 的字典
+- `compute_returns_and_advantages()`: 在顺序轨迹上计算 GAE 优势和回报（Episode 结束时由 `_run_episode` 调用）
 
 ### 4.4 GAE 优势估计
 
@@ -280,6 +283,10 @@ $$
 $$
 
 从后向前递推计算，优势最终做标准化：$\hat{A} \leftarrow (\hat{A} - \mu) / (\sigma + \epsilon)$。
+
+**GAE 必须在每个智能体的完整顺序轨迹上计算**，不能在随机采样的 mini-batch 上计算。原因：GAE 公式中 $V(s_{t+1})$ 必须是时序上「下一步」的价值估计，若轨迹被打乱，$V(s_{t+1})$ 指向随机邻居，returns 方差会爆炸（实测可达 50~200），导致 critic_loss 爆炸至 5000~15000。
+
+实现约束：`compute_returns_and_advantages()` 在 `_run_episode` 末尾、`add_from_agent_buffer()` 之前调用，结果写回各 `Transition.advantage` 和 `Transition.ret`。`_ppo_update` 直接从 batch 读取预计算值，不再重新计算 GAE。
 
 ---
 
@@ -302,6 +309,8 @@ for episode in 1..epochs:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
+│ 0. 重置决策计数: _agent_decision_count[:] = 0            │
+│                                                          │
 │ 1. 环境重置: env.reset() → obs_dict                     │
 │ 2. 智能体重置: agent.reset_episode()                     │
 │ 3. 缓冲区清空: agent_buffers[m].clear()                  │
@@ -320,17 +329,24 @@ for episode in 1..epochs:
 │                                                          │
 │        for m in available_agents:                        │
 │            action, log_prob, h_pi = agent.act(obs_m)     │
+│            current_task_id = topo_order[step_idx - 1]   │  ← 记录任务节点
 │            value, h_V = agent.get_value(global_obs)      │
 │            计算执行时隙 (geometric distribution)           │
 │            更新 local_clock[m]                           │
-│            存储 Transition 到 AgentBuffer[m]              │
+│            存储 Transition(task_id=current_task_id) 到 AgentBuffer[m] │
 │                                                          │
 │        next_obs, rewards, done, info = env.step(actions) │
 │        回填 reward 和 done 到对应 Transition              │
 │                                                          │
-│ 6. Episode 结束:                                         │
-│    将所有 AgentBuffer 倒入 GlobalBuffer                  │
-│    计算平均奖励                                           │
+│ 6. Episode 结束，GAE 预计算 (入 GlobalBuffer 之前):       │
+│    for each agent m:                                     │
+│        用 agents[m].critic 对顺序轨迹估计 values_m        │
+│        adv_m, ret_m = compute_returns_and_advantages(    │
+│            rewards_m, values_m, dones_m)                 │
+│        写回 buf.transitions[i].advantage / .ret          │
+│                                                          │
+│ 7. 将所有 AgentBuffer 倒入 GlobalBuffer                  │
+│    avg_reward = total_reward / episode_decisions         │  ← 除以本 episode 决策数
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -354,20 +370,21 @@ local_clock[m] = global_step + exec_slots
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ 1. 从 GlobalBuffer 采样 mini-batch                       │
+│    batch = {obs, actions, h_pi, h_V, global_obs,        │
+│             log_probs, advantages, returns, task_ids}    │
 │                                                          │
-│ 2. 估计旧价值:                                           │
-│    with no_grad:                                         │
-│        for each sample:                                  │
-│            V(s) = Critic(global_obs, h_V)               │
+│ 2. 直接使用预计算的 GAE 优势和回报:                       │
+│    advantages_t = batch["advantages"]   ← 顺序轨迹预计算  │
+│    returns_t    = batch["returns"]      ← 顺序轨迹预计算  │
+│    advantages_t = normalize(advantages_t)                │
 │                                                          │
-│ 3. 计算 GAE 优势和回报:                                  │
-│    advantages, returns = GAE(rewards, values, dones)     │
-│    advantages = normalize(advantages)                    │
-│                                                          │
-│ 4. 对每个智能体执行 PPO 更新:                             │
+│ 3. 对每个智能体执行 PPO 更新:                             │
 │    for agent in agents:                                  │
 │        log_probs, entropies, values, _ =                 │
-│            agent.evaluate_actions(batch...)               │
+│            agent.evaluate_actions(obs, actions,          │
+│                global_obs, h_pi, h_V,                   │
+│                dag_x, dag_ei, res_x, res_ei,            │
+│                task_ids)               ← 传入 task_id     │
 │                                                          │
 │        ratio = exp(log_probs_new - log_probs_old)        │
 │        surr1 = ratio × advantages                        │
@@ -383,7 +400,7 @@ local_clock[m] = global_step + exec_slots
 │        clip_grad_norm_(max_grad_norm)                    │
 │        optimizer.step()                                  │
 │                                                          │
-│ 5. 返回平均 loss 指标                                    │
+│ 4. 返回平均 loss 指标                                    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -439,13 +456,16 @@ IoTD (N=100) → UAV (M=4, agents) → LEO Satellite (K=8) → Cloud (1)
 #### 奖励函数
 
 $$
-r_m = -\eta_t \cdot T_i - \eta_e \cdot E_i - \lambda_c \cdot \sum_{j=1}^{5} \Phi_j
+r_m = -\eta_t \cdot T_i - \eta_e \cdot \alpha_E \cdot E_i - \lambda_c \cdot \sum_{j=1}^{5} \Phi_j
 $$
 
 其中：
 - $T_i = T_{trans} + T_{comp}$ — 任务完成时间
 - $E_i = E_{tx} + E_{comp}$ — 能耗
+- $\alpha_E = 0.01$ — 能量缩放因子（`_E_SCALE`），将 $E_i$ 压缩到与 $T_i$ 同量级
 - $\Phi_j$ — 5 类约束违反指示器
+
+**量级说明**：Cloud offloading 场景下，$E_{comp} = \kappa \cdot C \cdot f^2 \approx 10\,\text{J}$，而 $T_{comp} \approx 0.1\,\text{s}$，导致 $\eta_e \cdot E_i$ 比 $\eta_t \cdot T_i$ 大约 100 倍。不加 $\alpha_E$ 时策略梯度被能量项主导，时延优化的梯度信号被淹没。$\alpha_E = 0.01$ 使两项量级之比保持在 0.1~10 之间。
 
 #### 约束违反 (5类)
 
@@ -542,21 +562,35 @@ agent.encode(dag_x, dag_ei, res_x, res_ei)
     循环每步:
     │
     ├── agent.act(obs_m)
-    │       ├── h_v_t = node_embs[topo_order[step_idx]]  ── 当前任务节点嵌入
-    │       ├── server_agg = mean(server_embs)            ── 服务器聚合
-    │       ├── L_us_agg = mean(upstream decisions)       ── 上游决策聚合
-    │       ├── a_prev = obs[29:37]                       ── 前一动作
+    │       ├── task_id = topo_order[step_idx]   ── 读取后 step_idx 自增
+    │       ├── h_v_t = node_embs[task_id]        ── 当前任务节点嵌入
+    │       ├── server_agg = mean(server_embs)    ── 服务器聚合
+    │       ├── L_us_agg = mean(upstream decisions)── 上游决策聚合
+    │       ├── a_prev = obs[29:37]               ── 前一动作
     │       └── ActorV2.forward(h_v_t, L_us_agg, server_agg, a_prev, h_pi, node_embs)
     │               → action, log_prob, h_pi_next
+    │
+    ├── current_task_id = topo_order[step_idx - 1]  ← 记录本次决策的任务节点
     │
     ├── agent.get_value(global_obs)
     │       └── Critic.forward(global_obs, h_V)
     │               → value, h_V_next
     │
-    ├── Transition(obs, action, reward=0, h_pi, h_V, global_obs, done=False, log_prob)
+    ├── Transition(obs, action, reward=0, h_pi, h_V, global_obs,
+    │             done=False, log_prob, task_id=current_task_id)
     │       → AgentBuffer[m].add(t)
     │
     └── env.step(action_dict) → 回填 reward & done
+
+    Episode 结束，GAE 预计算 (入 GlobalBuffer 前):
+    │
+    ├── for each agent m:
+    │       rewards_m, dones_m ← buf.transitions
+    │       values_m ← agents[m].critic(顺序推理，no_grad)
+    │       adv_m, ret_m = compute_returns_and_advantages(rewards_m, values_m, dones_m)
+    │       写回 buf.transitions[i].advantage / .ret
+    │
+    └── GlobalBuffer.add_from_agent_buffer(buf)  ← 此后 buf 中含 advantage/ret/task_id
 ```
 
 ### 8.2 PPO 更新数据流
@@ -565,18 +599,22 @@ agent.encode(dag_x, dag_ei, res_x, res_ei)
 GlobalBuffer.sample(mini_batch_size)
     │
     ▼
-batch = {obs(B,37), actions(B,8), rewards(B,), h_pi(B,1,1,64), h_V(B,1,1,64),
-         global_obs(B,148), dones(B,), log_probs(B,)}
+batch = {obs(B,37), actions(B,8), h_pi(B,1,1,64), h_V(B,1,1,64),
+         global_obs(B,148), log_probs(B,),
+         advantages(B,),   ← 预计算（顺序轨迹）
+         returns(B,),      ← 预计算（顺序轨迹）
+         task_ids(B,)}     ← 每样本对应的 DAG 节点索引
     │
-    ├── 计算 V_old(s) (no_grad, 逐样本)
-    │
-    ├── GAE: advantages(B,), returns(B,)
+    ├── advantages_t = normalize(batch["advantages"])
     │
     └── for agent in agents:
             agent.evaluate_actions(obs, actions, global_obs, h_pi, h_V,
-                                   dag_x, dag_ei, res_x, res_ei)
+                                   dag_x, dag_ei, res_x, res_ei,
+                                   task_ids)          ← task_id 驱动 node_embs 索引
                 │
                 ├── GNNEncoderV2.forward() ── 重新编码（训练模式）
+                │
+                ├── h_v_t_batch = node_embs[task_ids]  ← 按 task_id 精确索引
                 │
                 ├── ActorV2.evaluate(h_v_t, L_us_agg, server_agg, a_prev,
                 │                    h_pi, node_embs, discrete_actions, continuous_actions)
@@ -626,6 +664,30 @@ $$
 - **共享**: `GNNEncoderV2`（所有智能体共享同一编码器）
 - **独立**: 每个 `ActorV2` 和 `Critic` 有独立参数
 - **统一优化器**: 所有参数使用单一 Adam 优化器
+
+### 9.5 实现约束（v2.1 修复记录）
+
+以下约束来自 v2.0 训练发散的根因分析（调试报告: `docs/superpowers/plans/2026-04-22-amappov2-debug-plan.md`），**必须严格遵守**：
+
+#### 约束 C1：GAE 必须在顺序轨迹上计算
+
+GAE 公式依赖时序连续性（$V(s_{t+1})$ 必须是真实下一步的估计）。将 GAE 放在随机采样的 mini-batch 上计算会导致 returns 方差爆炸，`critic_loss` 膨胀至 5000~15000。
+
+**规则**：`compute_returns_and_advantages` 仅在 `_run_episode` 末尾、对每个 AgentBuffer 的完整顺序轨迹调用。`_ppo_update` 直接读取 `Transition.advantage` 和 `Transition.ret`，不得重新计算 GAE。
+
+#### 约束 C2：`evaluate_actions` 必须按 task_id 索引 node_embs
+
+PPO ratio 计算要求新旧策略在**相同输入特征**下评估同一动作。`act()` 使用 `node_embs[task_id]` 作为 GRU 输入；`evaluate_actions` 如果固定使用 `node_embs[0]`，当 `task_id ≠ 0` 时新旧策略输入空间不同，ratio 在 batch 上均值趋近于 1，PPO 梯度消失，`actor_loss ≈ 0`。
+
+**规则**：每个 Transition 必须记录 `task_id`；`evaluate_actions` 签名必须包含 `task_ids_batch` 参数，并使用 `node_embs[task_ids]` 索引。
+
+#### 约束 C3：avg_reward 必须除以本 episode 的决策数
+
+`_agent_decision_count` 应在每个 `_run_episode` 开始时清零。日志打印时使用当前 episode 末尾的计数值（不累积多个 episode）。
+
+#### 约束 C4：奖励中能量项必须加缩放因子
+
+Cloud offloading 场景下 $E_{comp} \approx 10\,\text{J}$，而 $T_{comp} \approx 0.1\,\text{s}$，导致能量梯度信号约为时延信号的 100 倍。必须使用 `_E_SCALE = 0.01`（或等效调整 `eta_e`）使两项量级相当，否则策略无法同时优化时延和能耗。
 
 ---
 

@@ -182,6 +182,7 @@ class MAPPOAgentV2:
         dag_edge_index:   torch.Tensor,
         res_x:            torch.Tensor,
         res_edge_index:   torch.Tensor,
+        task_ids_batch:   torch.Tensor,   # (B,) task node index per sample
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B = obs_batch.shape[0]
         obs_batch        = obs_batch.to(self.device)
@@ -209,8 +210,9 @@ class MAPPOAgentV2:
 
         server_agg_batch = server_embs.mean(dim=0).unsqueeze(0).expand(B, -1)  # (B, 64)
 
-        # h_v_t: use node_embs[0] as representative (consistent with AMAPPOTrainer's "representative graph" approach)
-        h_v_t_batch = node_embs[0:1].expand(B, -1)   # (B, 64)
+        # h_v_t: index node_embs by the task_id each sample was generated from
+        task_ids = task_ids_batch.long().to(self.device)  # (B,)
+        h_v_t_batch = node_embs[task_ids]                 # (B, 64)
 
         h_pi_init = h_pi_batch.squeeze(1).squeeze(1).unsqueeze(0)  # (1, B, 64)
 

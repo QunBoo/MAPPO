@@ -145,7 +145,6 @@ class AMAPPOv2Trainer:
                     f"decisions={decisions_per_agent}",
                     flush=True,
                 )
-                self._agent_decision_count[:] = 0
 
             if ep % self.cfg.save_interval == 0:
                 self._save_checkpoint(ep)
@@ -156,6 +155,7 @@ class AMAPPOv2Trainer:
     # ------------------------------------------------------------------
 
     def _run_episode(self) -> Tuple[float, dict]:
+        self._agent_decision_count[:] = 0   # reset per-episode counter at episode start
         obs_dict = self.env.reset()
 
         for agent in self.agents:
@@ -190,6 +190,8 @@ class AMAPPOv2Trainer:
 
                 action, log_prob, h_pi = agent.act(obs_m)
                 value, h_V = agent.get_value(global_obs)
+                # Record the task_id used in act() so evaluate_actions can reproduce the same embedding
+                current_task_id = agent.topo_order[agent.step_idx - 1]  # step_idx was incremented in act()
                 # Pad action to env ACTION_DIM (8) if actor output is shorter
                 if action.shape[0] < self.cfg.action_dim:
                     action = np.concatenate([
@@ -218,6 +220,7 @@ class AMAPPOv2Trainer:
                     global_obs=global_obs.copy(),
                     done=False,
                     log_prob=log_prob,
+                    task_id=current_task_id,
                 )
                 self.agent_buffers[m].add(t)
 
@@ -239,11 +242,38 @@ class AMAPPOv2Trainer:
             if done:
                 break
 
+        # Pre-compute GAE on each agent's sequential trajectory before shuffling into GlobalBuffer
+        for m, buf in enumerate(self.agent_buffers):
+            if len(buf.transitions) == 0:
+                continue
+            rewards_m = np.array([t.reward for t in buf.transitions], dtype=np.float32)
+            dones_m   = np.array([float(t.done) for t in buf.transitions], dtype=np.float32)
+
+            values_m = []
+            self.agents[m].critic.eval()
+            with torch.no_grad():
+                for t in buf.transitions:
+                    g_obs = torch.tensor(t.global_obs, dtype=torch.float32, device=self.device)
+                    h_v_in = torch.tensor(t.h_V, dtype=torch.float32, device=self.device
+                             ).squeeze(1).squeeze(1).unsqueeze(0)
+                    v, _ = self.agents[m].critic(g_obs, h_v_in)
+                    values_m.append(v.item())
+            values_m = np.array(values_m, dtype=np.float32)
+
+            adv_m, ret_m = self.global_buffer.compute_returns_and_advantages(
+                rewards_m, values_m, dones_m,
+                gamma=self.cfg.gamma, gae_lambda=self.cfg.gae_lambda,
+            )
+            for i, t in enumerate(buf.transitions):
+                t.advantage = float(adv_m[i])
+                t.ret       = float(ret_m[i])
+
         for buf in self.agent_buffers:
             self.global_buffer.add_from_agent_buffer(buf)
             buf.clear()
 
-        avg_reward = total_reward / max(1, sum(self._agent_decision_count))
+        ep_decisions = int(self._agent_decision_count.sum())
+        avg_reward = total_reward / max(1, ep_decisions)
         return avg_reward, last_info
 
     # ------------------------------------------------------------------
@@ -253,40 +283,22 @@ class AMAPPOv2Trainer:
 
         obs_t        = torch.tensor(batch["obs"],        dtype=torch.float32, device=self.device)
         actions_t    = torch.tensor(batch["actions"],    dtype=torch.float32, device=self.device)
-        rewards_t    = torch.tensor(batch["rewards"],    dtype=torch.float32, device=self.device)
         h_pi_t       = torch.tensor(batch["h_pi"],       dtype=torch.float32, device=self.device)
         h_V_t        = torch.tensor(batch["h_V"],        dtype=torch.float32, device=self.device)
         global_obs_t = torch.tensor(batch["global_obs"], dtype=torch.float32, device=self.device)
-        dones_t      = torch.tensor(batch["dones"],      dtype=torch.float32, device=self.device)
         log_probs_old_t = torch.tensor(batch["log_probs"], dtype=torch.float32, device=self.device)
+        task_ids_t   = torch.tensor(batch["task_ids"],   dtype=torch.long,    device=self.device)
 
-        B = obs_t.shape[0]
+        # Use pre-computed GAE advantages and returns (computed on sequential per-agent trajectories)
+        advantages_t = torch.tensor(batch["advantages"], dtype=torch.float32, device=self.device)
+        returns_t    = torch.tensor(batch["returns"],    dtype=torch.float32, device=self.device)
+        advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
+
         dag_x, dag_ei, res_x, res_ei = _build_graph_inputs_v2(self.env, 0)
         dag_x  = dag_x.to(self.device)
         dag_ei = dag_ei.to(self.device)
         res_x  = res_x.to(self.device)
         res_ei = res_ei.to(self.device)
-
-        with torch.no_grad():
-            agent0 = self.agents[0]
-            values_np_list = []
-            for i in range(B):
-                g_obs_i = global_obs_t[i:i+1]
-                h_v_i   = h_V_t[i:i+1].squeeze(1).squeeze(1).unsqueeze(0)
-                v, _ = agent0.critic(g_obs_i, h_v_i)
-                values_np_list.append(v.item())
-            values_np = np.array(values_np_list, dtype=np.float32)
-
-        rewards_np = rewards_t.cpu().numpy()
-        dones_np   = dones_t.cpu().numpy()
-        advantages_np, returns_np = self.global_buffer.compute_returns_and_advantages(
-            rewards_np, values_np, dones_np,
-            gamma=self.cfg.gamma, gae_lambda=self.cfg.gae_lambda,
-        )
-
-        advantages_t = torch.tensor(advantages_np, dtype=torch.float32, device=self.device)
-        returns_t    = torch.tensor(returns_np,    dtype=torch.float32, device=self.device)
-        advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
 
         # Aggregate loss over all agents (parameter sharing)
         total_actor_loss = 0.0
@@ -301,6 +313,7 @@ class AMAPPOv2Trainer:
             log_probs_new, entropies, values_new, _ = agent.evaluate_actions(
                 obs_t, actions_t, global_obs_t, h_pi_t, h_V_t,
                 dag_x, dag_ei, res_x, res_ei,
+                task_ids_t,   # task_id per sample for correct node embedding lookup
             )
 
             ratio  = torch.exp(log_probs_new - log_probs_old_t)
