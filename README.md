@@ -50,11 +50,16 @@ AMAPPO复现/
 │   ├── gnn_encoder.py          # 双路 GNN 编码器（任务DAG + 资源图）
 │   ├── actor.py                # Actor 网络（GRU + 离散/连续混合动作头）
 │   ├── critic.py               # Critic 网络（全局状态价值估计）
-│   └── agent.py                # Agent 封装（act / get_value / evaluate_actions）
+│   ├── agent.py                # Agent 封装（act / get_value / evaluate_actions）
+│   └── v2/                     # v2 论文对齐版本
+│       ├── gnn_encoder_v2.py   #   双向拼接 + 节点级输出编码器
+│       ├── actor_v2.py         #   GRU + 注意力 + LEO/UAV 独立动作头
+│       └── agent_v2.py         #   encode/act/reset 分离式 Agent
 │
 ├── algorithms/                 # 训练算法
 │   ├── mappo.py                # 同步 MAPPO 训练器（基线）
-│   └── amappo.py               # 异步 AMAPPO 训练器（双时钟机制）
+│   ├── amappo.py               # 异步 AMAPPO 训练器（双时钟机制）
+│   └── amappo_v2.py            # AMAPPOv2 训练器（论文对齐版本）
 │
 ├── utils/                      # 工具模块
 │   ├── config.py               # 超参数配置（dataclass）
@@ -63,6 +68,7 @@ AMAPPO复现/
 │
 └── experiments/                # 实验入口
     ├── train.py                # 训练主入口（命令行参数解析）
+    ├── train_v2.py             # AMAPPOv2 训练入口
     └── plot_results.py         # 结果可视化（收敛曲线 + 对比柱状图）
 ```
 
@@ -168,6 +174,30 @@ python experiments/train.py \
     --mini_batch_size 128 \
     --max_steps 200 \
     --device cpu \
+    --log_dir runs \
+    --checkpoint_dir checkpoints
+```
+
+### 训练 AMAPPOv2（论文对齐版本）
+
+AMAPPOv2 是对齐论文设计的改进版本，核心改进包括：双向拼接编码器、节点级输出、GRU 注意力机制、GraphEnc 初始化、LEO/UAV 独立动作头。
+
+```bash
+# 训练 AMAPPOv2（默认配置）
+python experiments/train_v2.py --epochs 1500 --seed 42
+
+# 训练 AMAPPOv2（使用 CUDA）
+python experiments/train_v2.py --epochs 1500 --seed 42 --device cuda
+
+# 自定义超参数
+python experiments/train_v2.py \
+    --epochs 1500 \
+    --seed 42 \
+    --lr 5e-4 \
+    --mini_batch_size 128 \
+    --max_steps 200 \
+    --gru_hidden 64 \
+    --device cuda \
     --log_dir runs \
     --checkpoint_dir checkpoints
 ```
