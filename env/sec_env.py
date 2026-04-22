@@ -605,6 +605,16 @@ class SECEnv:
     # ==========================================================================
 
     @property
+    def resource_graph(self) -> dict:
+        """Resource graph info: {server_name: {load, capacity}}."""
+        return {
+            "local": {"load": float(self.server_loads[0]), "capacity": float(_F_LOCAL)},
+            "uav":   {"load": float(self.server_loads[1]), "capacity": float(_F_UAV)},
+            "sat":   {"load": float(self.server_loads[2]), "capacity": float(_F_SAT)},
+            "cloud": {"load": float(self.server_loads[3]), "capacity": float(_F_CLOUD)},
+        }
+
+    @property
     def done(self) -> bool:
         return self._done
 

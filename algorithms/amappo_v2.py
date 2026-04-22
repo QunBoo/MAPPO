@@ -137,9 +137,13 @@ class AMAPPOv2Trainer:
                 decisions_per_agent = self._agent_decision_count.tolist()
                 print(
                     f"[AMAPPOv2] ep={ep:4d}  reward={ep_reward:8.3f}  "
+                    f"actor_loss={train_metrics['actor_loss']:.4f}  "
+                    f"critic_loss={train_metrics['critic_loss']:.4f}  "
+                    f"entropy={train_metrics['entropy']:.4f}  "
                     f"T={ep_info.get('T_total', 0):.4f}  "
                     f"E={ep_info.get('E_total', 0):.4e}  "
-                    f"decisions={decisions_per_agent}"
+                    f"decisions={decisions_per_agent}",
+                    flush=True,
                 )
                 self._agent_decision_count[:] = 0
 
@@ -147,7 +151,7 @@ class AMAPPOv2Trainer:
                 self._save_checkpoint(ep)
 
         self.logger.close()
-        print("[AMAPPOv2] Training complete.")
+        print("[AMAPPOv2] Training complete.", flush=True)
 
     # ------------------------------------------------------------------
 
@@ -186,6 +190,12 @@ class AMAPPOv2Trainer:
 
                 action, log_prob, h_pi = agent.act(obs_m)
                 value, h_V = agent.get_value(global_obs)
+                # Pad action to env ACTION_DIM (8) if actor output is shorter
+                if action.shape[0] < self.cfg.action_dim:
+                    action = np.concatenate([
+                        action,
+                        np.zeros(self.cfg.action_dim - action.shape[0], dtype=np.float32),
+                    ])
                 action_dict[m] = action
 
                 task_node = self.env._current_task(m)
@@ -324,4 +334,4 @@ class AMAPPOv2Trainer:
             state[f"actor_{m}"]  = agent.actor.state_dict()
             state[f"critic_{m}"] = agent.critic.state_dict()
         torch.save(state, path)
-        print(f"[AMAPPOv2] Checkpoint saved: {path}")
+        print(f"[AMAPPOv2] Checkpoint saved: {path}", flush=True)
