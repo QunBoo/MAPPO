@@ -212,18 +212,26 @@ tensorboard --logdir runs
 ### 可视化结果对比
 
 ```bash
-# 默认读取 runs/amappo 和 runs/mappo
+# 默认绘制所有可用算法
 python experiments/plot_results.py --output_dir figures
 
-# 指定目录
+# 只绘制 AMAPPOv2
+python experiments/plot_results.py --algos amappo_v2 --output_dir figures
+
+# 仅对比 AMAPPOv2 vs MAPPO
+python experiments/plot_results.py --algos amappo_v2,mappo --output_dir figures
+
+# 三算法对比 + 指定目录
 python experiments/plot_results.py \
+    --algos amappo,amappo_v2,mappo \
     --amappo_dir runs/amappo \
+    --amappo_v2_dir runs/amappo_v2 \
     --mappo_dir  runs/mappo \
     --output_dir figures
 ```
 
 输出图表：
-- `figures/convergence_reward.png`：AMAPPO vs MAPPO 奖励收敛曲线（均值 ± 标准差）
+- `figures/convergence_reward.png`：奖励收敛曲线（均值 ± 标准差）
 - `figures/convergence_cost.png`：系统成本收敛曲线
 - `figures/bar_comparison.png`：最后 100 轮平均性能对比柱状图
 

@@ -1,16 +1,25 @@
 """
-Result visualization for AMAPPO vs MAPPO comparison.
+Result visualization for AMAPPO / AMAPPOv2 / MAPPO comparison.
 
 Usage:
-    # After training with multiple seeds, plot convergence curves:
-    python experiments/plot_results.py --log_dir runs --output_dir figures
+    # Default: all available algorithms
+    python experiments/plot_results.py --output_dir figures
 
-    # Or point to specific TensorBoard event files:
-    python experiments/plot_results.py --amappo_dir runs/amappo --mappo_dir runs/mappo
+    # Plot specific algorithms only
+    python experiments/plot_results.py --algos amappo_v2 --output_dir figures
+    python experiments/plot_results.py --algos amappo_v2,mappo --output_dir figures
+
+    # Specify directories explicitly
+    python experiments/plot_results.py \
+        --amappo_dir runs/amappo \
+        --amappo_v2_dir runs/amappo_v2 \
+        --mappo_dir  runs/mappo \
+        --output_dir figures
 
 The script reads TensorBoard event logs and produces:
   1. Convergence curves: reward vs episode (mean ± std across seeds)
-  2. Cost bar chart: last-100-episode average for each algorithm
+  2. Cost convergence curves
+  3. Bar chart: last-100-episode average for each algorithm
 """
 
 from __future__ import annotations
@@ -94,36 +103,49 @@ def align_and_stack(runs: List[np.ndarray]) -> Optional[np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
-# Plot helpers
+# Plot helpers — parameterized for N algorithms
 # ---------------------------------------------------------------------------
 
+# Default algorithm registry: (label, color)
+ALGO_STYLE = {
+    "amappo":    ("AMAPPO",   "tab:blue"),
+    "amappo_v2": ("AMAPPOv2", "tab:green"),
+    "mappo":     ("MAPPO",    "tab:orange"),
+}
+
+
 def plot_convergence(
-    amappo_values: Optional[np.ndarray],
-    mappo_values:  Optional[np.ndarray],
+    algo_data: Dict[str, Optional[np.ndarray]],
     output_path: str,
     title: str = "Training Convergence",
     ylabel: str = "Episode Reward",
 ):
     """
-    Line plot of mean ± std across seeds.
-    amappo_values / mappo_values: (n_seeds, T) or None
+    Line plot of mean ± std across seeds for multiple algorithms.
+
+    algo_data: {algo_key: (n_seeds, T) array or None}
     """
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(9, 5))
     x_label = "Episode (×log_interval)"
 
-    for label, values, color in [
-        ("AMAPPO", amappo_values, "tab:blue"),
-        ("MAPPO",  mappo_values,  "tab:orange"),
-    ]:
+    has_data = False
+    for algo_key, values in algo_data.items():
         if values is None or values.shape[0] == 0:
             continue
+        label, color = ALGO_STYLE.get(algo_key, (algo_key, None))
         mean = values.mean(axis=0)
         std  = values.std(axis=0)
         xs   = np.arange(len(mean))
         ax.plot(xs, mean, label=label, color=color)
         ax.fill_between(xs, mean - std, mean + std, alpha=0.25, color=color)
+        has_data = True
+
+    if not has_data:
+        plt.close(fig)
+        print(f"[plot] No data to plot for {output_path}, skipped.")
+        return
 
     ax.set_xlabel(x_label)
     ax.set_ylabel(ylabel)
@@ -137,19 +159,31 @@ def plot_convergence(
 
 
 def plot_bar_comparison(
-    amappo_last100: float,
-    mappo_last100: float,
+    algo_last100: Dict[str, float],
     output_path: str,
     metric_name: str = "Avg Episode Reward (last 100 eps)",
 ):
-    """Bar chart comparing final performance."""
+    """Bar chart comparing final performance across multiple algorithms."""
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(5, 4))
-    algos  = ["AMAPPO", "MAPPO"]
-    values = [amappo_last100, mappo_last100]
-    colors = ["tab:blue", "tab:orange"]
-    bars   = ax.bar(algos, values, color=colors, width=0.4)
+    # Filter out zero-value entries that mean "no data"
+    filtered = {k: v for k, v in algo_last100.items() if v != 0.0}
+    if not filtered:
+        print(f"[plot] No data for bar chart, skipped.")
+        return
+
+    algos  = []
+    values = []
+    colors = []
+    for algo_key, val in filtered.items():
+        label, color = ALGO_STYLE.get(algo_key, (algo_key, None))
+        algos.append(label)
+        values.append(val)
+        colors.append(color)
+
+    width = min(0.4, 1.6 / len(algos))
+    fig, ax = plt.subplots(figsize=(max(5, 2 * len(algos)), 4))
+    bars = ax.bar(algos, values, color=colors, width=width)
 
     for bar, val in zip(bars, values):
         ax.text(
@@ -173,16 +207,22 @@ def plot_bar_comparison(
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Plot AMAPPO vs MAPPO results")
-    parser.add_argument("--log_dir",     type=str, default="runs",
-                        help="Base TensorBoard log directory (contains amappo/ and mappo/ subdirs)")
-    parser.add_argument("--amappo_dir",  type=str, default=None,
+    parser = argparse.ArgumentParser(description="Plot AMAPPO / AMAPPOv2 / MAPPO results")
+    parser.add_argument("--log_dir",       type=str, default="runs",
+                        help="Base TensorBoard log directory (contains algo subdirs)")
+    parser.add_argument("--algos",         type=str, default=None,
+                        help="Comma-separated list of algorithms to plot "
+                             "(e.g. amappo,amappo_v2,mappo). "
+                             "Default: all available algorithms")
+    parser.add_argument("--amappo_dir",    type=str, default=None,
                         help="Override: explicit amappo TensorBoard directory")
-    parser.add_argument("--mappo_dir",   type=str, default=None,
+    parser.add_argument("--amappo_v2_dir", type=str, default=None,
+                        help="Override: explicit amappo_v2 TensorBoard directory")
+    parser.add_argument("--mappo_dir",     type=str, default=None,
                         help="Override: explicit mappo TensorBoard directory")
-    parser.add_argument("--output_dir",  type=str, default="figures",
+    parser.add_argument("--output_dir",    type=str, default="figures",
                         help="Directory to save output figures")
-    parser.add_argument("--tag",         type=str, default="episode/reward",
+    parser.add_argument("--tag",           type=str, default="episode/reward",
                         help="TensorBoard scalar tag to plot")
     return parser.parse_args()
 
@@ -191,23 +231,52 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    amappo_base = args.amappo_dir or os.path.join(args.log_dir, "amappo")
-    mappo_base  = args.mappo_dir  or os.path.join(args.log_dir, "mappo")
+    # All known algorithms
+    all_algo_keys = ["amappo", "amappo_v2", "mappo"]
 
-    print(f"[plot] Reading AMAPPO from: {amappo_base}")
-    print(f"[plot] Reading MAPPO  from: {mappo_base}")
+    # Determine which algorithms to plot
+    if args.algos is not None:
+        selected = [a.strip() for a in args.algos.split(",")]
+        unknown = set(selected) - set(all_algo_keys)
+        if unknown:
+            parser = parse_args()
+            parser.error(f"Unknown algorithm(s): {unknown}. Available: {all_algo_keys}")
+    else:
+        selected = all_algo_keys
 
-    amappo_runs = collect_runs(amappo_base, args.tag)
-    mappo_runs  = collect_runs(mappo_base,  args.tag)
+    # Resolve directories (only for selected algorithms)
+    default_dirs = {
+        "amappo":    args.amappo_dir    or os.path.join(args.log_dir, "amappo"),
+        "amappo_v2": args.amappo_v2_dir or os.path.join(args.log_dir, "amappo_v2"),
+        "mappo":     args.mappo_dir     or os.path.join(args.log_dir, "mappo"),
+    }
+    algo_dirs = {k: default_dirs[k] for k in selected}
 
-    amappo_stacked = align_and_stack(amappo_runs)
-    mappo_stacked  = align_and_stack(mappo_runs)
+    for algo_key, d in algo_dirs.items():
+        label = ALGO_STYLE.get(algo_key, (algo_key,))[0]
+        print(f"[plot] Reading {label} from: {d}")
 
-    # Convergence curve
+    # Collect reward data
+    reward_stacked: Dict[str, Optional[np.ndarray]] = {}
+    for algo_key, base_dir in algo_dirs.items():
+        if not os.path.isdir(base_dir):
+            print(f"[plot] Directory not found, skipping {algo_key}: {base_dir}")
+            reward_stacked[algo_key] = None
+            continue
+        runs = collect_runs(base_dir, args.tag)
+        reward_stacked[algo_key] = align_and_stack(runs)
+
+    # Build title from available algorithms
+    active_labels = [
+        ALGO_STYLE[k][0] for k, v in reward_stacked.items() if v is not None
+    ]
+    title_suffix = " vs ".join(active_labels) if active_labels else "No Data"
+
+    # Convergence curve — reward
     plot_convergence(
-        amappo_stacked, mappo_stacked,
+        reward_stacked,
         output_path=os.path.join(args.output_dir, "convergence_reward.png"),
-        title="AMAPPO vs MAPPO — Training Convergence",
+        title=f"{title_suffix} — Training Convergence",
         ylabel="Episode Reward",
     )
 
@@ -217,29 +286,33 @@ def main():
             return 0.0
         return float(stacked[:, -100:].mean())
 
-    amappo_final = last100_mean(amappo_stacked)
-    mappo_final  = last100_mean(mappo_stacked)
+    algo_last100 = {k: last100_mean(v) for k, v in reward_stacked.items()}
 
-    print(f"[plot] AMAPPO last-100 avg reward: {amappo_final:.4f}")
-    print(f"[plot] MAPPO  last-100 avg reward: {mappo_final:.4f}")
+    for algo_key, val in algo_last100.items():
+        label = ALGO_STYLE.get(algo_key, (algo_key,))[0]
+        print(f"[plot] {label} last-100 avg reward: {val:.4f}")
 
     plot_bar_comparison(
-        amappo_final, mappo_final,
+        algo_last100,
         output_path=os.path.join(args.output_dir, "bar_comparison.png"),
     )
 
-    # Also plot cost (negative reward) if tag changes don't already do this
+    # Cost convergence
     cost_tag = "episode/cost"
-    amappo_cost_runs = collect_runs(amappo_base, cost_tag)
-    mappo_cost_runs  = collect_runs(mappo_base,  cost_tag)
-    amappo_cost = align_and_stack(amappo_cost_runs)
-    mappo_cost  = align_and_stack(mappo_cost_runs)
+    cost_stacked: Dict[str, Optional[np.ndarray]] = {}
+    for algo_key, base_dir in algo_dirs.items():
+        if not os.path.isdir(base_dir):
+            cost_stacked[algo_key] = None
+            continue
+        cost_runs = collect_runs(base_dir, cost_tag)
+        cost_stacked[algo_key] = align_and_stack(cost_runs)
 
-    if amappo_cost is not None or mappo_cost is not None:
+    has_cost = any(v is not None for v in cost_stacked.values())
+    if has_cost:
         plot_convergence(
-            amappo_cost, mappo_cost,
+            cost_stacked,
             output_path=os.path.join(args.output_dir, "convergence_cost.png"),
-            title="AMAPPO vs MAPPO — System Cost",
+            title=f"{title_suffix} — System Cost",
             ylabel="System Cost",
         )
 
