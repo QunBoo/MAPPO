@@ -1,4 +1,18 @@
 # AMAPPOv2 Implementation Plan
+根据docs\superpowers\plans\2026-04-22-amappov2-implementation-plan.md的AMAPPOv2实现计划，开展AMAPPOv2算法的开发。
+
+计划概览：7 个任务，按依赖顺序排列
+
+任务	产物	测试数量
+Task 1	子包骨架 models/v2/ + 测试目录	—
+Task 2	GNNEncoderV2（双向拼接 + 节点级输出）	4 个
+Task 3	ActorV2（GRU + 注意力 + LEO/UAV 动作头）	7 个
+Task 4	MAPPOAgentV2（encode/act/reset）	6 个
+Task 5	AMAPPOv2Trainer	导入验证
+Task 6	experiments/train_v2.py	导入验证
+Task 7	整合验证 + smoke test	1 个
+
+使用Subagent-Driven方式执行 — 每个任务派发独立子 agent 执行，任务间有 review 检查点，迭代快
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

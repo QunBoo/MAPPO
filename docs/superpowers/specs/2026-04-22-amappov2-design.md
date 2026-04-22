@@ -284,7 +284,7 @@ python experiments/train_v2.py --epochs 1500 --seed 42 --device cuda
 
 | 差异项 | 当前 AMAPPO | AMAPPOv2 |
 |--------|------------|-----------|
-| 编码器输出粒度 | 128 维图级嵌入（标量） | `(N,64)` 节点嵌入 + `(4,64)` 服务器嵌入 + `(64,)` ��局编码 |
+| 编码器输出粒度 | 128 维图级嵌入（标量） | `(N,64)` 节点嵌入 + `(4,64)` 服务器嵌入 + `(64,)` 全局编码 |
 | 双向融合方式 | `h_fwd + h_bwd`（求和） | `concat([h_fwd, h_bwd])`（拼接） |
 | 全局图编码 | 直接 max-pool | FC 投影后 max-pool |
 | GRU 初始化 | 零初始化 | `Linear(graph_enc)` 投影 |
