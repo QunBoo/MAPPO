@@ -29,6 +29,8 @@ class Config:
     mini_batch_size: int = 128  # mini-batch size
     epochs: int = 1500          # total training episodes
     max_grad_norm: float = 0.5  # gradient clipping
+    ppo_epochs: int = 4         # PPO update epochs per update cycle (Fix D)
+    update_every: int = 5       # accumulate N episodes before PPO update (Fix C)
 
     # Network
     gru_hidden: int = 64        # GRU hidden size

@@ -1,7 +1,7 @@
 # AMAPPOv2 算法技术规格文档
 
-> **版本**: v2.1  
-> **最后更新**: 2026-04-22  
+> **版本**: v2.2  
+> **最后更新**: 2026-04-23  
 > **核心模块**: `algorithms/amappo_v2.py`, `models/v2/`, `utils/buffer.py`, `env/sec_env.py`
 
 ---
@@ -255,6 +255,7 @@ upstream_actions = [self.decisions[t] for t in self.topo_order[:self.step_idx] i
 | `advantage` | scalar | GAE 优势（在顺序轨迹上预计算后写入） |
 | `ret` | scalar | GAE 回报（advantage + V(s)） |
 | `task_id` | int | 本次决策对应的 DAG 任务节点索引 |
+| `agent_id` | int | 记录该 transition 属于哪个智能体（用于 PPO 更新时按 agent 分组） |
 
 ### 4.2 AgentBuffer
 
@@ -264,9 +265,12 @@ upstream_actions = [self.decisions[t] for t in self.topo_order[:self.step_idx] i
 
 全局经验池 MB，容量 50000，先进先出。提供：
 
-- `add_from_agent_buffer()`: 从 AgentBuffer 倒入数据（含预计算的 `advantage`、`ret`、`task_id`）
-- `sample(batch_size)`: 随机采样 mini-batch，返回包含 `advantages`、`returns`、`task_ids` 的字典
+- `add_from_agent_buffer()`: 从 AgentBuffer 倒入数据（含预计算的 `advantage`、`ret`、`task_id`、`agent_id`）
+- `sample(batch_size)`: 随机采样 mini-batch，返回包含 `advantages`、`returns`、`task_ids`、`agent_ids` 的字典
 - `compute_returns_and_advantages()`: 在顺序轨迹上计算 GAE 优势和回报（Episode 结束时由 `_run_episode` 调用）
+- `clear()`: 清空 buffer，每次 PPO 更新后调用以保持同策略纯洁性（Fix C）
+
+**同策略约束（Fix C）**：PPO 是同策略算法，buffer 中的旧数据会因策略偏移导致 importance sampling 失效。每次 PPO 更新后必须调用 `clear()` 清空 buffer，仅保留当前策略采集的数据。
 
 ### 4.4 GAE 优势估计
 
@@ -297,13 +301,17 @@ $$
 ```
 for episode in 1..epochs:
     1. _run_episode()       ← 收集经验
-    2. if buffer >= mini_batch_size:
-           _ppo_update()    ← PPO 策略更新
+    2. if episode % update_every == 0:
+           if buffer >= mini_batch_size:
+               _ppo_update()    ← PPO 策略更新（K=ppo_epochs 轮）
+               buffer.clear()   ← 清空 buffer（同策略约束）
     3. if episode % log_interval == 0:
            log metrics
     4. if episode % save_interval == 0:
            save checkpoint
 ```
+
+**更新频率（Fix C）**：每 `update_every`（默认 5）个 episode 执行一次 PPO 更新，而非每个 episode 更新。累积多个 episode 的数据可增大有效 batch 规模，提升梯度估计稳定性。
 
 ### 5.2 Episode 执行流程 (`_run_episode`)
 
@@ -321,6 +329,7 @@ for episode in 1..epochs:
 │        agent.encode(dag_x, dag_ei, res_x, res_ei)       │
 │        → 缓存 node_embs, server_embs, graph_enc          │
 │        → 初始化 h_pi, 计算拓扑排序                        │
+│        → 缓存 DAG tensors 到 _dag_tensors[m]（供 PPO 更新使用）│
 │                                                          │
 │ 5. 异步决策循环:                                         │
 │    while not done:                                       │
@@ -333,7 +342,7 @@ for episode in 1..epochs:
 │            value, h_V = agent.get_value(global_obs)      │
 │            计算执行时隙 (geometric distribution)           │
 │            更新 local_clock[m]                           │
-│            存储 Transition(task_id=current_task_id) 到 AgentBuffer[m] │
+│            存储 Transition(task_id=current_task_id, agent_id=m) 到 AgentBuffer[m] │
 │                                                          │
 │        next_obs, rewards, done, info = env.step(actions) │
 │        回填 reward 和 done 到对应 Transition              │
@@ -369,38 +378,53 @@ local_clock[m] = global_step + exec_slots
 
 ```
 ┌─────────────────────────────────────────────────────────┐
+│ 对 ppo_epochs 轮执行（Fix D: 多 epoch 更新提升样本利用率）│
+│                                                          │
 │ 1. 从 GlobalBuffer 采样 mini-batch                       │
 │    batch = {obs, actions, h_pi, h_V, global_obs,        │
-│             log_probs, advantages, returns, task_ids}    │
+│             log_probs, advantages, returns,              │
+│             task_ids, agent_ids}                         │
 │                                                          │
 │ 2. 直接使用预计算的 GAE 优势和回报:                       │
 │    advantages_t = batch["advantages"]   ← 顺序轨迹预计算  │
 │    returns_t    = batch["returns"]      ← 顺序轨迹预计算  │
 │    advantages_t = normalize(advantages_t)                │
 │                                                          │
-│ 3. 对每个智能体执行 PPO 更新:                             │
-│    for agent in agents:                                  │
-│        log_probs, entropies, values, _ =                 │
-│            agent.evaluate_actions(obs, actions,          │
-│                global_obs, h_pi, h_V,                   │
-│                dag_x, dag_ei, res_x, res_ei,            │
-│                task_ids)               ← 传入 task_id     │
+│ 3. optimizer.zero_grad()  ← 仅一次（Fix A: 合并梯度）    │
 │                                                          │
-│        ratio = exp(log_probs_new - log_probs_old)        │
-│        surr1 = ratio × advantages                        │
-│        surr2 = clamp(ratio, 1-ε, 1+ε) × advantages      │
+│ 4. 对每个智能体执行 PPO 评估（Fix A: 累加梯度不 step）:  │
+│    for agent_id, agent in agents:                        │
+│        # Fix B: 使用该智能体自己的 DAG 编码               │
+│        dag_x, dag_ei, res_x, res_ei =                   │
+│            _get_dag_tensors(agent_id)                    │
+│                                                          │
+│        # 按 agent_id 过滤，确保 DAG 编码与数据匹配       │
+│        mask = (agent_ids == agent_id)                    │
+│        if mask.sum() == 0: continue                      │
+│                                                          │
+│        log_probs, entropies, values, _ =                 │
+│            agent.evaluate_actions(obs[mask], actions[mask]│
+│                global_obs[mask], h_pi[mask], h_V[mask],  │
+│                dag_x, dag_ei, res_x, res_ei,            │
+│                task_ids[mask])  ← 按该 agent 的 DAG 编码  │
+│                                                          │
+│        ratio = exp(log_probs_new - log_probs_old[mask])  │
+│        surr1 = ratio × advantages[mask]                  │
+│        surr2 = clamp(ratio, 1-ε, 1+ε) × advantages[mask]│
 │        actor_loss  = -min(surr1, surr2).mean()           │
-│        critic_loss = MSE(values, returns)                │
+│        critic_loss = MSE(values, returns[mask])          │
 │        entropy     = entropies.mean()                    │
 │                                                          │
 │        loss = actor_loss + 0.5×critic_loss - 0.01×entropy│
+│        loss.backward()     ← 累加梯度（不在循环内 step） │
 │                                                          │
-│        optimizer.zero_grad()                             │
-│        loss.backward()                                   │
-│        clip_grad_norm_(max_grad_norm)                    │
-│        optimizer.step()                                  │
+│ 5. 统一裁剪 + 更新（Fix A: 所有 agent 梯度累加后统一 step）│
+│    clip_grad_norm_(max_grad_norm)                        │
+│    optimizer.step()                                      │
 │                                                          │
-│ 4. 返回平均 loss 指标                                    │
+│ 6. PPO 更新后清空 buffer（Fix C: 同策略约束）            │
+│                                                          │
+│ 7. 返回平均 loss 指标（除以 agent 数 × ppo_epochs）      │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -526,6 +550,8 @@ $$
 | `mini_batch_size` | 128 | Mini-batch 大小 |
 | `epochs` | 1500 | 训练 Episode 数 |
 | `max_grad_norm` | 0.5 | 梯度裁剪阈值 |
+| `ppo_epochs` | 4 | PPO 每次更新的 epoch 数（Fix D） |
+| `update_every` | 5 | 累积多少 episode 后执行一次 PPO 更新（Fix C） |
 
 ### 7.4 网络参数
 
@@ -603,27 +629,37 @@ batch = {obs(B,37), actions(B,8), h_pi(B,1,1,64), h_V(B,1,1,64),
          global_obs(B,148), log_probs(B,),
          advantages(B,),   ← 预计算（顺序轨迹）
          returns(B,),      ← 预计算（顺序轨迹）
-         task_ids(B,)}     ← 每样本对应的 DAG 节点索引
+         task_ids(B,),     ← 每样本对应的 DAG 节点索引
+         agent_ids(B,)}    ← 每样本对应的智能体编号
     │
     ├── advantages_t = normalize(batch["advantages"])
     │
-    └── for agent in agents:
-            agent.evaluate_actions(obs, actions, global_obs, h_pi, h_V,
-                                   dag_x, dag_ei, res_x, res_ei,
-                                   task_ids)          ← task_id 驱动 node_embs 索引
-                │
-                ├── GNNEncoderV2.forward() ── 重新编码（训练模式）
-                │
-                ├── h_v_t_batch = node_embs[task_ids]  ← 按 task_id 精确索引
-                │
-                ├── ActorV2.evaluate(h_v_t, L_us_agg, server_agg, a_prev,
-                │                    h_pi, node_embs, discrete_actions, continuous_actions)
-                │       → log_probs(B,), entropies(B,)
-                │
-                ├── Critic.forward(global_obs, h_V)
-                │       → values(B,)
-                │
-                └── PPO loss 计算 → backward → optimizer.step()
+    └── for agent_id, agent in agents:        ← Fix A: 累加梯度
+            # Fix B: 使用该智能体的 DAG 编码（从 _dag_tensors 缓存获取）
+            dag_x, dag_ei, res_x, res_ei = _get_dag_tensors(agent_id)
+            │
+            ├── mask = (agent_ids == agent_id)  ← 按 agent_id 过滤
+            │
+            ├── agent.evaluate_actions(obs[mask], actions[mask],
+            │       global_obs[mask], h_pi[mask], h_V[mask],
+            │       dag_x, dag_ei, res_x, res_ei,
+            │       task_ids[mask])          ← task_id 驱动 node_embs 索引
+            │       │
+            │       ├── GNNEncoderV2.forward() ── 重新编码（训练模式，使用该 agent 的 DAG）
+            │       │
+            │       ├── h_v_t_batch = node_embs[task_ids]  ← 按 task_id 精确索引
+            │       │
+            │       ├── ActorV2.evaluate(...)
+            │       │       → log_probs, entropies
+            │       │
+            │       └── Critic.forward(global_obs, h_V)
+            │               → values
+            │
+            ├── PPO loss 计算 → loss.backward()  ← 累加梯度，不在循环内 step
+            │
+        clip_grad_norm_()  ← Fix A: 所有 agent 梯度累加后统一裁剪
+        optimizer.step()   ← Fix A: 统一更新
+        buffer.clear()     ← Fix C: 清空 buffer 保持同策略
 ```
 
 ---
@@ -667,7 +703,7 @@ $$
 
 ### 9.5 实现约束（v2.1 修复记录）
 
-以下约束来自 v2.0 训练发散的根因分析（调试报告: `docs/superpowers/plans/2026-04-22-amappov2-debug-plan.md`），**必须严格遵守**：
+以下约束来自 v2.0/v2.1 训练发散的根因分析（调试报告: `docs/superpowers/plans/2026-04-22-amappov2-debug-plan.md` 及 `2026-04-23-amappov2-debug-plan.md`），**必须严格遵守**：
 
 #### 约束 C1：GAE 必须在顺序轨迹上计算
 
@@ -689,6 +725,30 @@ PPO ratio 计算要求新旧策略在**相同输入特征**下评估同一动作
 
 Cloud offloading 场景下 $E_{comp} \approx 10\,\text{J}$，而 $T_{comp} \approx 0.1\,\text{s}$，导致能量梯度信号约为时延信号的 100 倍。必须使用 `_E_SCALE = 0.01`（或等效调整 `eta_e`）使两项量级相当，否则策略无法同时优化时延和能耗。
 
+#### 约束 C5：PPO 更新必须合并所有 agent 的梯度后统一 step（Fix A）
+
+全部 agent 共享 `shared_encoder` 和同一个 optimizer。若在 agent 循环内对每个 agent 分别 `zero_grad()` → `backward()` → `step()`，则后一个 agent 的 `zero_grad()` 会清除前一个 agent 对 encoder 累积的梯度，最终 encoder 只接收最后一个 agent 的梯度信号，前 75% 梯度信息被丢弃。
+
+**规则**：`zero_grad()` 只在 agent 循环外调用一次；所有 agent 的 `loss.backward()` 累加梯度；循环结束后统一 `clip_grad_norm_()` + `optimizer.step()`。
+
+#### 约束 C6：PPO 更新时每个 agent 必须使用自己的 DAG 编码（Fix B）
+
+`GlobalBuffer` 存放了所有 agent 的 transitions。每个 agent 采集时使用自己的 DAG 生成 `log_prob_old`。若 PPO 更新时统一使用 agent 0 的 DAG 重新编码，则 agent 1~3 的 `node_embs[task_ids]` 基于错误的 DAG，`log_prob_new` 与 `log_prob_old` 的输入特征不匹配，ratio 变为随机噪声，PPO surrogate 梯度方向不一致。
+
+**规则**：Episode 编码阶段必须缓存每个 agent 的 DAG tensors 到 `_dag_tensors[m]`；PPO 更新时通过 `_get_dag_tensors(agent_id)` 获取对应 agent 的 DAG；按 `agent_ids` 做 mask 过滤，确保每个 agent 只用自己 DAG 编码的 node_embs 评估自己的 transitions。
+
+#### 约束 C7：PPO 更新后必须清空 GlobalBuffer（Fix C）
+
+PPO 是同策略（on-policy）算法，importance sampling 修正仅在策略偏移很小时有效（clip 到 1±0.2）。若 buffer 保留多个 episode 前的旧数据，`log_prob_old` 来自历经多次策略更新的旧策略，ratio 可能爆炸或趋于 0，clip 无法修正。
+
+**规则**：每次 PPO 更新后必须调用 `global_buffer.clear()`；训练循环按 `update_every` 累积 N 个 episode 后统一更新并清空。
+
+#### 约束 C8：PPO 每次更新应执行多个 epoch（Fix D）
+
+标准 PPO 在每次数据采集后进行 K 个 epoch 的更新（通常 K=4~10）。若每 episode 仅用 1 个 mini-batch 更新一次，每条 transition 平均参与训练 < 1 次，样本利用率极低，critic 收敛速度慢。
+
+**规则**：`_ppo_update` 外层循环 `ppo_epochs`（默认 4）轮，每轮采样新的 mini-batch 进行更新。
+
 ---
 
 ## 10. 训练入口
@@ -706,6 +766,8 @@ python experiments/train_v2.py \
     --eps_clip 0.2 \
     --mini_batch_size 128 \
     --max_grad_norm 0.5 \
+    --ppo_epochs 4 \
+    --update_every 5 \
     --log_interval 100 \
     --save_interval 100
 ```

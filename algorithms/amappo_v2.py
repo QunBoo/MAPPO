@@ -112,17 +112,20 @@ class AMAPPOv2Trainer:
 
         self._train_step = 0
         self._agent_decision_count: np.ndarray = np.zeros(config.M, dtype=int)
+        self._dag_tensors: list = []   # per-agent (dag_x, dag_ei, res_x, res_ei), updated each episode
 
     # ------------------------------------------------------------------
 
     def train(self):
+        train_metrics = {"critic_loss": 0.0, "actor_loss": 0.0, "entropy": 0.0}
         for ep in range(1, self.cfg.epochs + 1):
             ep_reward, ep_info = self._run_episode()
 
-            if len(self.global_buffer) >= self.cfg.mini_batch_size:
-                train_metrics = self._ppo_update()
-            else:
-                train_metrics = {"critic_loss": 0.0, "actor_loss": 0.0, "entropy": 0.0}
+            # Fix C: accumulate update_every episodes, then PPO update + clear buffer
+            if ep % self.cfg.update_every == 0:
+                if len(self.global_buffer) >= self.cfg.mini_batch_size:
+                    train_metrics = self._ppo_update()
+                    self.global_buffer.clear()   # on-policy: discard stale data
 
             if ep % self.cfg.log_interval == 0:
                 metrics = {
@@ -164,9 +167,16 @@ class AMAPPOv2Trainer:
             buf.clear()
 
         # <-- Key difference from AMAPPOTrainer: encode once -->
+        self._dag_tensors = []
         for m, agent in enumerate(self.agents):
             dag_x, dag_ei, res_x, res_ei = _build_graph_inputs_v2(self.env, m)
             agent.encode(dag_x, dag_ei, res_x, res_ei)
+            self._dag_tensors.append((
+                dag_x.to(self.device),
+                dag_ei.to(self.device),
+                res_x.to(self.device),
+                res_ei.to(self.device),
+            ))
 
         local_clocks: np.ndarray = np.zeros(self.cfg.M, dtype=int)
         total_reward = 0.0
@@ -221,6 +231,7 @@ class AMAPPOv2Trainer:
                     done=False,
                     log_prob=log_prob,
                     task_id=current_task_id,
+                    agent_id=m,
                 )
                 self.agent_buffers[m].add(t)
 
@@ -278,55 +289,80 @@ class AMAPPOv2Trainer:
 
     # ------------------------------------------------------------------
 
-    def _ppo_update(self) -> dict:
-        batch = self.global_buffer.sample(self.cfg.mini_batch_size)
-
-        obs_t        = torch.tensor(batch["obs"],        dtype=torch.float32, device=self.device)
-        actions_t    = torch.tensor(batch["actions"],    dtype=torch.float32, device=self.device)
-        h_pi_t       = torch.tensor(batch["h_pi"],       dtype=torch.float32, device=self.device)
-        h_V_t        = torch.tensor(batch["h_V"],        dtype=torch.float32, device=self.device)
-        global_obs_t = torch.tensor(batch["global_obs"], dtype=torch.float32, device=self.device)
-        log_probs_old_t = torch.tensor(batch["log_probs"], dtype=torch.float32, device=self.device)
-        task_ids_t   = torch.tensor(batch["task_ids"],   dtype=torch.long,    device=self.device)
-
-        # Use pre-computed GAE advantages and returns (computed on sequential per-agent trajectories)
-        advantages_t = torch.tensor(batch["advantages"], dtype=torch.float32, device=self.device)
-        returns_t    = torch.tensor(batch["returns"],    dtype=torch.float32, device=self.device)
-        advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
-
+    def _get_dag_tensors(self, agent_id: int):
+        """Return DAG tensors cached for the given agent during episode encoding."""
+        if self._dag_tensors and agent_id < len(self._dag_tensors):
+            return self._dag_tensors[agent_id]
+        # Fallback: rebuild from env (should not trigger, but prevents crash)
         dag_x, dag_ei, res_x, res_ei = _build_graph_inputs_v2(self.env, 0)
-        dag_x  = dag_x.to(self.device)
-        dag_ei = dag_ei.to(self.device)
-        res_x  = res_x.to(self.device)
-        res_ei = res_ei.to(self.device)
+        return (
+            dag_x.to(self.device), dag_ei.to(self.device),
+            res_x.to(self.device), res_ei.to(self.device),
+        )
 
-        # Aggregate loss over all agents (parameter sharing)
-        total_actor_loss = 0.0
+    def _ppo_update(self) -> dict:
+        total_actor_loss  = 0.0
         total_critic_loss = 0.0
-        total_entropy = 0.0
+        total_entropy     = 0.0
 
-        for agent in self.agents:
-            self.shared_encoder.train()
-            agent.actor.train()
-            agent.critic.train()
+        for _ in range(self.cfg.ppo_epochs):
+            batch = self.global_buffer.sample(self.cfg.mini_batch_size)
 
-            log_probs_new, entropies, values_new, _ = agent.evaluate_actions(
-                obs_t, actions_t, global_obs_t, h_pi_t, h_V_t,
-                dag_x, dag_ei, res_x, res_ei,
-                task_ids_t,   # task_id per sample for correct node embedding lookup
-            )
+            obs_t        = torch.tensor(batch["obs"],        dtype=torch.float32, device=self.device)
+            actions_t    = torch.tensor(batch["actions"],    dtype=torch.float32, device=self.device)
+            h_pi_t       = torch.tensor(batch["h_pi"],       dtype=torch.float32, device=self.device)
+            h_V_t        = torch.tensor(batch["h_V"],        dtype=torch.float32, device=self.device)
+            global_obs_t = torch.tensor(batch["global_obs"], dtype=torch.float32, device=self.device)
+            log_probs_old_t = torch.tensor(batch["log_probs"], dtype=torch.float32, device=self.device)
+            task_ids_t   = torch.tensor(batch["task_ids"],   dtype=torch.long,    device=self.device)
+            agent_ids_t  = torch.tensor(batch["agent_ids"],  dtype=torch.long,    device=self.device)
 
-            ratio  = torch.exp(log_probs_new - log_probs_old_t)
-            surr1  = ratio * advantages_t
-            surr2  = torch.clamp(ratio, 1 - self.cfg.eps_clip, 1 + self.cfg.eps_clip) * advantages_t
-            actor_loss  = -torch.min(surr1, surr2).mean()
-            critic_loss = nn.functional.mse_loss(values_new, returns_t)
-            entropy     = entropies.mean()
+            advantages_t = torch.tensor(batch["advantages"], dtype=torch.float32, device=self.device)
+            returns_t    = torch.tensor(batch["returns"],    dtype=torch.float32, device=self.device)
+            advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
 
-            loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
-
+            # Fix A: accumulate all agent losses, then single backward + step
             self.optimizer.zero_grad()
-            loss.backward()
+
+            epoch_actor  = 0.0
+            epoch_critic = 0.0
+            epoch_ent    = 0.0
+
+            for agent_id, agent in enumerate(self.agents):
+                # Fix B: use this agent's own DAG encoding
+                dag_x, dag_ei, res_x, res_ei = self._get_dag_tensors(agent_id)
+
+                self.shared_encoder.train()
+                agent.actor.train()
+                agent.critic.train()
+
+                # Select only this agent's transitions for correct DAG matching
+                mask = (agent_ids_t == agent_id)
+                if mask.sum() == 0:
+                    continue
+
+                log_probs_new, entropies, values_new, _ = agent.evaluate_actions(
+                    obs_t[mask], actions_t[mask], global_obs_t[mask],
+                    h_pi_t[mask], h_V_t[mask],
+                    dag_x, dag_ei, res_x, res_ei,
+                    task_ids_t[mask],
+                )
+
+                ratio  = torch.exp(log_probs_new - log_probs_old_t[mask])
+                surr1  = ratio * advantages_t[mask]
+                surr2  = torch.clamp(ratio, 1 - self.cfg.eps_clip, 1 + self.cfg.eps_clip) * advantages_t[mask]
+                actor_loss  = -torch.min(surr1, surr2).mean()
+                critic_loss = nn.functional.mse_loss(values_new, returns_t[mask])
+                entropy     = entropies.mean()
+
+                loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+                loss.backward()   # accumulate gradients (no zero_grad here)
+
+                epoch_actor  += actor_loss.item()
+                epoch_critic += critic_loss.item()
+                epoch_ent    += entropy.item()
+
+            # Fix A: unified clip + step after all agents
             nn.utils.clip_grad_norm_(
                 [p for pg in self.optimizer.param_groups for p in pg["params"]],
                 self.cfg.max_grad_norm,
@@ -334,15 +370,16 @@ class AMAPPOv2Trainer:
             self.optimizer.step()
             self._train_step += 1
 
-            total_actor_loss += actor_loss.item()
-            total_critic_loss += critic_loss.item()
-            total_entropy += entropy.item()
+            M = len(self.agents)
+            total_actor_loss  += epoch_actor  / M
+            total_critic_loss += epoch_critic / M
+            total_entropy     += epoch_ent    / M
 
-        M = len(self.agents)
+        n_epochs = self.cfg.ppo_epochs
         return {
-            "actor_loss":  total_actor_loss / M,
-            "critic_loss": total_critic_loss / M,
-            "entropy":     total_entropy / M,
+            "actor_loss":  total_actor_loss  / n_epochs,
+            "critic_loss": total_critic_loss / n_epochs,
+            "entropy":     total_entropy     / n_epochs,
         }
 
     # ------------------------------------------------------------------

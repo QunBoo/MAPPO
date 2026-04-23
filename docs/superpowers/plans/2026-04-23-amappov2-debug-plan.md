@@ -12,7 +12,7 @@
 
 ## 一、训练日志异常现象（基线：2026-04-23）
 
-**运行命令：** `python experiments/train_v2.py --epochs 1500 --seed 42`
+**运行命令：** `python experiments/train_v2.py --epochs 1500 --seed 42 --device cuda`
 
 | 指标 | 当前观测值 | 预期收敛值 | 异常特征 |
 |------|-----------|-----------|---------|
