@@ -63,8 +63,13 @@ AMAPPO复现/
 │
 ├── utils/                      # 工具模块
 │   ├── config.py               # 超参数配置（dataclass）
-│   ├── buffer.py               # 经验缓冲区（AgentBuffer / GlobalBuffer / GAE）
+│   ├── buffer.py               # 经验缓冲区（AgentBuffer / GlobalBuffer / GAE / agent_id）
 │   └── logger.py               # TensorBoard 日志封装
+│
+├── tests/                      # 测试模块
+│   └── v2/                     # AMAPPOv2 测试
+│       ├── test_convergence_monitor.py  # 训练收敛监控测试套件（T1-T6）
+│       └── ...                 # 单元测试
 │
 └── experiments/                # 实验入口
     ├── train.py                # 训练主入口（命令行参数解析）
@@ -105,11 +110,12 @@ AMAPPO 与 MAPPO 的核心区别在于**异步决策**：
 
 ### PPO 更新
 
-1. 从 GlobalBuffer 采样 mini-batch（默认 128）
-2. 计算 GAE 优势估计（γ=0.99, λ=0.95）
-3. 最小化 Critic TD 误差
-4. 最大化 Actor PPO-clip 目标（ε=0.2）
-5. 梯度裁剪（max_norm=0.5）后更新
+1. 累积 `update_every`（默认 5）个 episode 的经验
+2. 从 GlobalBuffer 采样 mini-batch（默认 128），连续 `ppo_epochs`（默认 4）轮
+3. 每个 agent 使用自己的 DAG 编码，按 `agent_id` 过滤 transitions
+4. 累加所有 agent 的梯度后统一 `clip_grad_norm` + `optimizer.step`
+5. 更新后清空 GlobalBuffer（保持同策略纯洁性）
+6. 计算 GAE 优势估计（γ=0.99, λ=0.95）
 
 ### 奖励函数
 
@@ -197,9 +203,21 @@ python experiments/train_v2.py \
     --mini_batch_size 128 \
     --max_steps 200 \
     --gru_hidden 64 \
+    --ppo_epochs 4 \
+    --update_every 5 \
     --device cuda \
     --log_dir runs \
     --checkpoint_dir checkpoints
+```
+
+### 运行测试
+
+```bash
+# 快速测试（单元级 + 短训练验证，约 1 分钟）
+python -m pytest tests/v2/ -m "not slow" -v
+
+# 完整收敛测试（含 1500 轮训练，约 10 分钟）
+python -m pytest tests/v2/test_convergence_monitor.py -v --timeout=600
 ```
 
 ### 查看训练曲线（TensorBoard）
@@ -254,6 +272,8 @@ python experiments/plot_results.py \
 | max_grad_norm | 0.5 | 梯度裁剪阈值 |
 | max_steps | 200 | 每 episode 最大步数 |
 | epochs | 1500 | 训练总 episode 数 |
+| ppo_epochs | 4 | PPO 每次更新的 epoch 数 |
+| update_every | 5 | 累积多少 episode 后执行 PPO 更新 |
 
 ---
 
@@ -261,5 +281,10 @@ python experiments/plot_results.py \
 
 - [x] AMAPPO 训练曲线可见收敛趋势（奖励上升并趋于稳定）
 - [x] 各智能体在同一 episode 内决策次数不同（异步机制验证）
+- [x] AMAPPOv2 梯度不再被覆盖，actor_loss 非零（Fix A）
+- [x] AMAPPOv2 各 agent 使用自己的 DAG 编码（Fix B）
+- [x] AMAPPOv2 PPO 更新后清空 buffer，保持同策略（Fix C）
+- [x] AMAPPOv2 多 epoch PPO 更新，提升样本利用率（Fix D）
+- [x] 收敛监控测试通过（T1-T6）
 - [ ] AMAPPO 系统成本低于 MAPPO（需完整 1500 轮训练验证）
 - [ ] 约束违反率随训练降低
