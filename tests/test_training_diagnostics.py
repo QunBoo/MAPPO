@@ -132,8 +132,8 @@ def test_T3_hv_mismatch_ratio():
     N = 10
     dag_x  = torch.rand(N, 5)
     dag_ei = torch.zeros((2, 0), dtype=torch.long)
-    res_x  = torch.rand(4, 2)
-    res_ei = torch.tensor([[i,j] for i in range(4) for j in range(4) if i!=j],
+    res_x  = torch.rand(cfg.resource_node_count, 2)
+    res_ei = torch.tensor([[i, j] for i in range(cfg.resource_node_count) for j in range(cfg.resource_node_count) if i != j],
                           dtype=torch.long).t().contiguous()
 
     with torch.no_grad():

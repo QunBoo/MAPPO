@@ -15,9 +15,9 @@ def _make_dag(n_nodes=5):
     return x, edge_index
 
 
-def _make_res():
-    x = torch.randn(4, 2)
-    edges = [[i, j] for i in range(4) for j in range(4) if i != j]
+def _make_res(n_resources=7):
+    x = torch.randn(n_resources, 2)
+    edges = [[i, j] for i in range(n_resources) for j in range(n_resources) if i != j]
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
     return x, edge_index
 
@@ -30,7 +30,7 @@ def test_output_shapes():
     node_embs, server_embs, graph_enc = encoder(dag_x, dag_ei, res_x, res_ei)
 
     assert node_embs.shape == (5, 64), f"node_embs: {node_embs.shape}"
-    assert server_embs.shape == (4, 64), f"server_embs: {server_embs.shape}"
+    assert server_embs.shape == (7, 64), f"server_embs: {server_embs.shape}"
     assert graph_enc.shape == (64,), f"graph_enc: {graph_enc.shape}"
 
 

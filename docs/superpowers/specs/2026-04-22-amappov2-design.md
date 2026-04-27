@@ -293,3 +293,11 @@ python experiments/train_v2.py --epochs 1500 --seed 42 --device cuda
 | 动作空间 | 统一 8 维（4+4） | LEO: 7 维（4+3），UAV: 9 维（4+5） |
 | 服务器嵌入来源 | obs 切片（原始观测） | GNNEncoderV2 输出（GNN 编码后） |
 | encode/decode 分离 | 无（每步重跑编码器） | episode 开始 `encode()` 一次，步骤内复用缓存 |
+## 2026-04-27 Resource Graph Update
+
+- The resource graph design is now fine-grained rather than 4-node aggregated.
+- Resource nodes are ordered as:
+  `local`, `uav_0..uav_{M-1}`, `sat_0..sat_{K-1}`, `cloud`.
+- `res_x` is `(R, 2)` with `R = M + K + 2`.
+- `server_embs` is `(R, 64)`.
+- Agent observations no longer keep a fixed 37-dim layout; `server_states` expands to `R` dims and `a_prev` remains the final 8 dims.

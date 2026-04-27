@@ -35,7 +35,6 @@ class Config:
     # Network
     gru_hidden: int = 64        # GRU hidden size
     gnn_out_dim: int = 128      # GNN output dim
-    obs_dim: int = 37           # observation dim (per agent)
     action_dim: int = 8         # action dim (per agent)
 
     # Logging
@@ -48,6 +47,16 @@ class Config:
     seed: int = 42
     device: str = "cpu"         # "cpu" or "cuda"
     algo: str = "amappo"        # "amappo" or "mappo"
+
+    resource_node_count: int = field(init=False)
+    obs_dim: int = field(init=False)
+
+    def __post_init__(self):
+        self.sync_derived_fields()
+
+    def sync_derived_fields(self):
+        self.resource_node_count = self.M + self.K + 2
+        self.obs_dim = 5 + 20 + self.resource_node_count + self.action_dim
 
     def to_dict(self):
         from dataclasses import asdict

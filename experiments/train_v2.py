@@ -65,6 +65,7 @@ def main():
         val = getattr(args, field, None)
         if val is not None:
             setattr(cfg, field, val)
+    cfg.sync_derived_fields()
 
     set_seed(cfg.seed)
 

@@ -51,19 +51,7 @@ def _build_graph_inputs_v2(env: SECEnv, agent_id: int):
     else:
         dag_ei = torch.zeros((2, 0), dtype=torch.long)
 
-    # Resource graph: 4 nodes
-    res_features = []
-    for srv in ["local", "uav", "sat", "cloud"]:
-        info = env.resource_graph.get(srv, {})
-        res_features.append([
-            float(info.get("load", 0.0)),
-            float(info.get("capacity", 1.0)),
-        ])
-    res_x = torch.tensor(res_features, dtype=torch.float32)
-
-    res_nodes = 4
-    res_edges = [[i, j] for i in range(res_nodes) for j in range(res_nodes) if i != j]
-    res_ei = torch.tensor(res_edges, dtype=torch.long).t().contiguous()
+    res_x, res_ei = env.get_resource_graph_data()
 
     return dag_x, dag_ei, res_x, res_ei
 
@@ -72,6 +60,7 @@ class AMAPPOv2Trainer:
     """AMAPPOv2: node-level embeddings + GRU + attention async MAPPO trainer."""
 
     def __init__(self, config: Config):
+        config.sync_derived_fields()
         self.cfg = config
         self.device = torch.device(config.device)
 
@@ -294,7 +283,7 @@ class AMAPPOv2Trainer:
         if self._dag_tensors and agent_id < len(self._dag_tensors):
             return self._dag_tensors[agent_id]
         # Fallback: rebuild from env (should not trigger, but prevents crash)
-        dag_x, dag_ei, res_x, res_ei = _build_graph_inputs_v2(self.env, 0)
+        dag_x, dag_ei, res_x, res_ei = _build_graph_inputs_v2(self.env, agent_id)
         return (
             dag_x.to(self.device), dag_ei.to(self.device),
             res_x.to(self.device), res_ei.to(self.device),

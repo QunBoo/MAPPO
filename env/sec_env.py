@@ -7,7 +7,8 @@ Satellite Edge Computing (SEC) Multi-Agent Environment — AMAPPO project.
 Each UAV agent manages a group of IoTDs, controls task offloading decisions,
 bandwidth/compute allocation, and its own 2-D movement.
 
-Observation per agent : 37 dims  [task_features(5) | upstream(20) | servers(4) | prev_action(8)]
+Observation per agent : dynamic dims
+    [task_features(5) | upstream(20) | servers(R=M+K+2) | prev_action(8)]
 Action per agent      :  8 dims  [offload_logits(4) | bandwidth(1) | compute(1) | displacement(2)]
 """
 
@@ -19,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import networkx as nx
+import torch
 
 from env.dag_generator import DAGGenerator
 from env.channel_model import (
@@ -49,12 +51,14 @@ _OFF_UAV   = 1
 _OFF_SAT   = 2
 _OFF_CLOUD = 3
 
-# Fixed obs/action dimensions
-OBS_DIM    = 37   # 5 + 20 + 4 + 8
+# Fixed action dimensions
 ACTION_DIM = 8    # 4 + 1 + 1 + 2
 
 # Max predecessor slots (padded)
 _MAX_PRED_SLOTS = 5
+_TASK_FEATURE_DIM = 5
+_UPSTREAM_FEATURE_DIM = _MAX_PRED_SLOTS * 4
+_BASE_OBS_DIM = _TASK_FEATURE_DIM + _UPSTREAM_FEATURE_DIM + ACTION_DIM
 
 
 class SECEnv:
@@ -77,6 +81,8 @@ class SECEnv:
     """
 
     def __init__(self, config) -> None:
+        if hasattr(config, "sync_derived_fields"):
+            config.sync_derived_fields()
         self.N         = int(config.N)
         self.M         = int(config.M)    # number of agents == number of UAVs
         self.K         = int(config.K)
@@ -91,9 +97,10 @@ class SECEnv:
         self.v_max   = float(getattr(config, "v_max",    30.0))
         self.d_min   = float(getattr(config, "d_min",    3.0))
         self.H_uav   = float(getattr(config, "H_uav",    50.0))
+        self.resource_node_count = int(getattr(config, "resource_node_count", self.M + self.K + 2))
 
         self.n_agents  = self.M
-        self.obs_dim   = OBS_DIM
+        self.obs_dim   = _BASE_OBS_DIM + self.resource_node_count
         self.action_dim = ACTION_DIM
 
         self._dag_gen = DAGGenerator()
@@ -114,8 +121,8 @@ class SECEnv:
         self._step_count: int = 0
         self._done: bool = False
 
-        # Per-server EMA load tracking [local, uav, sat, cloud]
-        self.server_loads: np.ndarray = np.zeros(4, dtype=np.float32)
+        # Per-resource EMA load tracking [local | UAV nodes | SAT nodes | cloud]
+        self.resource_loads: np.ndarray = np.zeros(self.resource_node_count, dtype=np.float32)
 
         # Per-agent task completion times (for deadline constraint)
         self._T_max: float = 5.0 * self.dt   # simple default deadline per task
@@ -135,7 +142,7 @@ class SECEnv:
         Returns
         -------
         dict
-            {agent_id: obs_array (37,)} for each agent in [0, M).
+            {agent_id: obs_array (obs_dim,)} for each agent in [0, M).
         """
         rng = np.random.default_rng()
 
@@ -183,7 +190,7 @@ class SECEnv:
         self.prev_actions = np.zeros((self.M, ACTION_DIM))
         self._step_count  = 0
         self._done        = False
-        self.server_loads = np.zeros(4, dtype=np.float32)
+        self.resource_loads = np.zeros(self.resource_node_count, dtype=np.float32)
 
         return self._get_obs_dict()
 
@@ -316,9 +323,10 @@ class SECEnv:
                 phi[4] = 1.0
                 violation_counts[4] += 1
 
-            # Update per-server EMA load
-            self.server_loads[off_idx] = (
-                0.9 * self.server_loads[off_idx] + 0.1 * comp
+            # Update the specific resource node selected by this offload route.
+            resource_idx = self.resource_index_for_offload(m, off_idx)
+            self.resource_loads[resource_idx] = (
+                0.9 * self.resource_loads[resource_idx] + 0.1 * comp
             )
 
             # --- Reward ---
@@ -364,8 +372,8 @@ class SECEnv:
         return {m: self._build_obs(m) for m in range(self.M)}
 
     def _build_obs(self, m: int) -> np.ndarray:
-        """Build 37-dim observation for agent m."""
-        obs = np.zeros(OBS_DIM, dtype=np.float32)
+        """Build observation for agent m with fine-grained resource states."""
+        obs = np.zeros(self.obs_dim, dtype=np.float32)
         ptr = 0
 
         dag  = self.dags[m]
@@ -389,7 +397,7 @@ class SECEnv:
             obs[2] = c_cyc
             obs[3] = deadline_rem
             obs[4] = topo_pos
-        ptr = 5
+        ptr = _TASK_FEATURE_DIM
 
         # ---- upstream_decisions (20 dims = 5 predecessors × 4 dims each) ----
         if task_node is not None:
@@ -403,15 +411,11 @@ class SECEnv:
                 obs[base + 1] = p_attrs["D_out"]
                 obs[base + 2] = p_attrs["C"]
                 obs[base + 3] = 1.0 if self._is_task_done(m, pred) else 0.0
-        ptr += _MAX_PRED_SLOTS * 4   # ptr = 25
+        ptr += _UPSTREAM_FEATURE_DIM
 
-        # ---- server_states (4 dims) ----
-        # EMA-tracked compute allocation per server [local, uav, sat, cloud]
-        obs[ptr + 0] = self.server_loads[0]  # local
-        obs[ptr + 1] = self.server_loads[1]  # UAV
-        obs[ptr + 2] = self.server_loads[2]  # satellite
-        obs[ptr + 3] = self.server_loads[3]  # cloud
-        ptr += 4   # ptr = 29
+        # ---- server_states (R dims) ----
+        obs[ptr: ptr + self.resource_node_count] = self.resource_loads
+        ptr += self.resource_node_count
 
         # ---- prev_action (8 dims) ----
         obs[ptr: ptr + ACTION_DIM] = self.prev_actions[m]
@@ -601,19 +605,103 @@ class SECEnv:
     def _sigmoid(x: float) -> float:
         return 1.0 / (1.0 + math.exp(-float(np.clip(x, -20, 20))))
 
+    # --- Resource graph helpers ---
+
+    def local_resource_index(self) -> int:
+        return 0
+
+    def uav_resource_index(self, uav_id: int) -> int:
+        return 1 + int(uav_id)
+
+    def first_sat_resource_index(self) -> int:
+        return 1 + self.M
+
+    def sat_resource_index(self, sat_id: int) -> int:
+        return self.first_sat_resource_index() + int(sat_id)
+
+    def cloud_resource_index(self) -> int:
+        return self.resource_node_count - 1
+
+    def resource_index_for_offload(self, agent_id: int, offload_idx: int) -> int:
+        if offload_idx == _OFF_LOCAL:
+            return self.local_resource_index()
+        if offload_idx == _OFF_UAV:
+            return self.uav_resource_index(agent_id)
+        if offload_idx == _OFF_SAT:
+            return self.sat_resource_index(self._nearest_sat(agent_id))
+        return self.cloud_resource_index()
+
+    def _resource_capacities(self) -> np.ndarray:
+        capacities = np.empty(self.resource_node_count, dtype=np.float32)
+        capacities[self.local_resource_index()] = _F_LOCAL
+        for m in range(self.M):
+            capacities[self.uav_resource_index(m)] = _F_UAV
+        for k in range(self.K):
+            capacities[self.sat_resource_index(k)] = _F_SAT
+        capacities[self.cloud_resource_index()] = _F_CLOUD
+        return capacities
+
+    def _resource_node_meta(self) -> List[dict]:
+        node_meta = [{"name": "local", "type": "local", "index": self.local_resource_index()}]
+        for m in range(self.M):
+            node_meta.append({
+                "name": f"uav_{m}",
+                "type": "uav",
+                "index": self.uav_resource_index(m),
+                "uav_id": m,
+            })
+        for k in range(self.K):
+            node_meta.append({
+                "name": f"sat_{k}",
+                "type": "sat",
+                "index": self.sat_resource_index(k),
+                "sat_id": k,
+            })
+        node_meta.append({
+            "name": "cloud",
+            "type": "cloud",
+            "index": self.cloud_resource_index(),
+        })
+        return node_meta
+
+    def get_resource_graph_data(self, include_meta: bool = False):
+        capacities = self._resource_capacities()
+        max_capacity = float(capacities.max()) if capacities.size else 1.0
+        res_x = np.column_stack([
+            self.resource_loads,
+            capacities / max(max_capacity, 1.0),
+        ]).astype(np.float32)
+
+        res_edges = [
+            [i, j]
+            for i in range(self.resource_node_count)
+            for j in range(self.resource_node_count)
+            if i != j
+        ]
+        res_edge_index = torch.tensor(res_edges, dtype=torch.long).t().contiguous()
+        res_x_t = torch.tensor(res_x, dtype=torch.float32)
+
+        if include_meta:
+            return res_x_t, res_edge_index, self._resource_node_meta()
+        return res_x_t, res_edge_index
+
     # ==========================================================================
     # Properties
     # ==========================================================================
 
     @property
     def resource_graph(self) -> dict:
-        """Resource graph info: {server_name: {load, capacity}}."""
-        return {
-            "local": {"load": float(self.server_loads[0]), "capacity": float(_F_LOCAL)},
-            "uav":   {"load": float(self.server_loads[1]), "capacity": float(_F_UAV)},
-            "sat":   {"load": float(self.server_loads[2]), "capacity": float(_F_SAT)},
-            "cloud": {"load": float(self.server_loads[3]), "capacity": float(_F_CLOUD)},
-        }
+        """Fine-grained resource graph info keyed by stable node names."""
+        capacities = self._resource_capacities()
+        graph = {}
+        for meta in self._resource_node_meta():
+            idx = meta["index"]
+            graph[meta["name"]] = {
+                "load": float(self.resource_loads[idx]),
+                "capacity": float(capacities[idx]),
+                "type": meta["type"],
+            }
+        return graph
 
     @property
     def done(self) -> bool:

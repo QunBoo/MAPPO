@@ -64,7 +64,7 @@ class MAPPOAgentV2:
 
         # Episode-level cache
         self.node_embs:   Optional[torch.Tensor] = None  # (N, 64)
-        self.server_embs: Optional[torch.Tensor] = None  # (4, 64)
+        self.server_embs: Optional[torch.Tensor] = None  # (R, 64)
         self.graph_enc:   Optional[torch.Tensor] = None  # (64,)
         self.topo_order:  Optional[List[int]] = None
         self.step_idx:    int = 0
@@ -143,7 +143,7 @@ class MAPPOAgentV2:
                 L_us_agg = torch.zeros(64, device=self.device)
 
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-            a_prev = obs_t[29:37]                              # (8,)
+            a_prev = obs_t[-8:]                                # (8,)
 
             action, log_prob, h_next = self.actor(
                 h_v_t, L_us_agg, server_agg, a_prev, self.h_pi, self.node_embs
@@ -173,9 +173,9 @@ class MAPPOAgentV2:
 
     def evaluate_actions(
         self,
-        obs_batch:        torch.Tensor,   # (B, 37)
+        obs_batch:        torch.Tensor,   # (B, obs_dim)
         actions_batch:    torch.Tensor,   # (B, d_a)
-        global_obs_batch: torch.Tensor,   # (B, 148)
+        global_obs_batch: torch.Tensor,   # (B, obs_dim * M)
         h_pi_batch:       torch.Tensor,   # (B, 1, 1, 64)
         h_V_batch:        torch.Tensor,   # (B, 1, 1, 64)
         dag_x:            torch.Tensor,
@@ -201,7 +201,7 @@ class MAPPOAgentV2:
         node_embs, server_embs, _ = self.encoder(dag_x, dag_edge_index, res_x, res_edge_index)
 
         # Slice obs for a_prev and upstream decisions
-        a_prev_batch   = obs_batch[:, 29:37]          # (B, 8)
+        a_prev_batch   = obs_batch[:, -8:]            # (B, 8)
         upstream_batch = obs_batch[:, 5:25]           # (B, 20)
 
         # L_us_agg: pad upstream_batch to 64 dims

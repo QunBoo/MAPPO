@@ -72,6 +72,7 @@ def build_config(args: argparse.Namespace) -> Config:
         val = getattr(args, field, None)
         if val is not None:
             setattr(cfg, field, val)
+    cfg.sync_derived_fields()
 
     return cfg
 

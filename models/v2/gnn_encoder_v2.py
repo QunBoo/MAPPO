@@ -55,10 +55,10 @@ class ResourceGraphEncoderV2(nn.Module):
         self.bn2 = nn.BatchNorm1d(hidden_dim)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        """Returns: server_embs (4, 64)"""
+        """Returns: server_embs (R, 64)"""
         h = F.relu(self.bn1(self.conv1(x, edge_index)))
         h = F.relu(self.bn2(self.conv2(h, edge_index)))
-        return h  # (4, 64)
+        return h  # (R, 64)
 
 
 class GNNEncoderV2(nn.Module):
@@ -72,13 +72,13 @@ class GNNEncoderV2(nn.Module):
         self,
         dag_x: torch.Tensor,           # (N, 5)
         dag_edge_index: torch.Tensor,  # (2, E)
-        res_x: torch.Tensor,           # (4, 2)
+        res_x: torch.Tensor,           # (R, 2)
         res_edge_index: torch.Tensor,  # (2, E_res)
     ):
         """
         Returns:
             node_embs:   (N, 64)   task node embeddings
-            server_embs: (4, 64)   server node embeddings
+            server_embs: (R, 64)   server node embeddings
             graph_enc:   (64,)     global graph encoding
         """
         node_embs, graph_enc = self.dag_encoder(dag_x, dag_edge_index)

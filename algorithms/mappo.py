@@ -74,28 +74,13 @@ def _build_graph_inputs(env: SECEnv, agent_id: int):
     else:
         dag_edge_index = torch.zeros((2, 0), dtype=torch.long)
 
-    # --- Resource graph: 4 nodes (local=0, UAV=1, SAT=2, cloud=3) ---
-    # Node features: [server_load, normalized_capacity]
-    capacities = [0.8, 3.0, 4.5, 10.0]  # GHz (rough)
-    max_cap = max(capacities)
-    res_x = np.array(
-        [[env.server_loads[i], capacities[i] / max_cap] for i in range(4)],
-        dtype=np.float32,
-    )  # (4, 2)
-
-    # Fully connected resource graph (undirected: add both directions)
-    res_src, res_dst = [], []
-    for i in range(4):
-        for j in range(4):
-            if i != j:
-                res_src.append(i)
-                res_dst.append(j)
-    res_edge_index = torch.tensor([res_src, res_dst], dtype=torch.long)
+    # --- Fine-grained resource graph ---
+    res_x, res_edge_index = env.get_resource_graph_data()
 
     return (
         torch.tensor(dag_x),
         dag_edge_index,
-        torch.tensor(res_x),
+        res_x,
         res_edge_index,
     )
 
@@ -108,6 +93,7 @@ class MAPPOTrainer:
     """Synchronous MAPPO trainer."""
 
     def __init__(self, config: Config):
+        config.sync_derived_fields()
         self.cfg = config
         self.device = torch.device(config.device)
 

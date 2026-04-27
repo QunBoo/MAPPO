@@ -792,3 +792,11 @@ state = {
 ```
 
 保存路径: `checkpoints/amappo_v2_ep{episode}.pt`
+## 2026-04-27 Resource Graph Update
+
+- `res_x` no longer uses the fixed shape `(4, 2)`.
+- The resource graph now uses `R = M + K + 2` nodes ordered as:
+  `local`, `uav_0..uav_{M-1}`, `sat_0..sat_{K-1}`, `cloud`.
+- `server_embs` is now `(R, 64)`.
+- `obs_dim` is now derived as `5 + 20 + R + 8 = 35 + M + K`.
+- `a_prev` should be read from the last 8 observation dims rather than the fixed slice `obs[29:37]`.
