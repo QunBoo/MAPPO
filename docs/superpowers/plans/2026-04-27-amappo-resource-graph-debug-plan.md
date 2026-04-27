@@ -70,11 +70,6 @@
 
 - `test_conda_appo_runtime_dependency_probe`
 
-说明：
-
-- 当前 `appo` 环境缺少 `pytest`
-- 因此仓库测试文件已经补齐，但本地验证主要通过 `conda run -n appo python -c ...` 和 CLI smoke 完成
-
 ## 推荐验证命令
 
 在具备完整依赖的 `appo` 环境中执行：
